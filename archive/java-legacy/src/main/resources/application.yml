@@ -1,0 +1,70 @@
+spring:
+  application:
+    name: multibagger-swing-trading
+  datasource:
+    url: jdbc:h2:mem:tradingdb
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: 
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    show-sql: false
+    properties:
+      hibernate:
+        format_sql: true
+  websocket:
+    message-broker:
+      application-destination-prefix: /app
+      simple-broker: /topic
+
+# API Configuration
+api:
+  nse:
+    enabled: true  # Re-enabled to use NSE API for lastPrice
+  yahoo-finance:
+    enabled: false  # Disabled to prioritize NSE
+  alpha-vantage:
+    enabled: false  # Disabled due to demo key limitations
+    key: demo  # Replace with your Alpha Vantage API key for real data
+  finnhub:
+    enabled: false  # Disabled due to demo key limitations
+    key: demo  # Replace with your Finnhub API key for real data
+  # MCP (Model Context Protocol) Server Configuration - Configured for NSE India
+  mcp:
+    enabled: true  # Enabled to fetch comprehensive data from NSE India
+    base-url: "https://www.nseindia.com"  # NSE India base URL
+    endpoint-pattern: "/api/quote-equity?symbol={symbol}"  # NSE API endpoint pattern
+    api-key: ""  # Not required for NSE
+    api-key-header: "X-API-Key"  # Not used for NSE
+    timeout: 10000  # Request timeout in milliseconds (10 seconds for NSE)
+    # JSON path mappings for extracting data from NSE response
+    json-path:
+      current-price: "priceInfo.lastPrice"  # NSE priceInfo structure
+      open: "priceInfo.open"
+      high: "priceInfo.intraDayHighLow.max"
+      low: "priceInfo.intraDayHighLow.min"
+      previous-close: "priceInfo.previousClose"
+      volume: "priceInfo.totalTradedVolume"
+      symbol: "info.symbol"  # NSE info structure
+  # News Analysis Configuration
+  news:
+    enabled: true  # Enable news analysis
+    source: mock  # Options: mock, web, mcp (mock for testing, web for real news APIs, mcp for MCP servers)
+
+# Streaming Configuration
+stream:
+  interval:
+    ms: 30000  # Update interval in milliseconds (30 seconds) - reduced frequency
+  enabled: false  # Disable automatic streaming to prevent API spam
+
+# Logging
+logging:
+  level:
+    com.trading: DEBUG
+    org.springframework.web: DEBUG
+    org.springframework.messaging: DEBUG

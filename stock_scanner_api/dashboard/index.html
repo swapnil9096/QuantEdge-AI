@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Stock Scanner API — Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0c0c0f;
+      --surface: #141418;
+      --surface2: #1c1c22;
+      --border: #2a2a32;
+      --text: #e4e4e7;
+      --textMuted: #71717a;
+      --accent: #22d3ee;
+      --accentDim: #0891b2;
+      --success: #4ade80;
+      --warn: #fbbf24;
+      --error: #f87171;
+      --radius: 10px;
+      --font: 'DM Sans', system-ui, sans-serif;
+      --fontMono: 'JetBrains Mono', monospace;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: var(--font); background: var(--bg); color: var(--text); line-height: 1.5; min-height: 100vh; }
+    .layout { display: flex; min-height: 100vh; }
+    .sidebar { width: 240px; background: var(--surface); border-right: 1px solid var(--border); padding: 1.25rem 0; flex-shrink: 0; }
+    .sidebar h1 { font-size: 1rem; font-weight: 700; margin: 0 1rem 1rem; color: var(--accent); letter-spacing: 0.02em; }
+    .nav { display: flex; flex-direction: column; gap: 2px; }
+    .nav a { display: block; padding: 0.5rem 1rem; color: var(--textMuted); text-decoration: none; font-size: 0.9rem; border-left: 3px solid transparent; }
+    .nav a:hover { color: var(--text); background: var(--surface2); }
+    .nav a.active { color: var(--accent); border-left-color: var(--accent); background: var(--surface2); }
+    .main { flex: 1; padding: 1.5rem 2rem; overflow-auto; }
+    .page { display: none; }
+    .page.active { display: block; }
+    .page h2 { font-size: 1.35rem; margin: 0 0 0.5rem; font-weight: 600; }
+    .page .sub { color: var(--textMuted); font-size: 0.9rem; margin-bottom: 1.25rem; }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.25rem; margin-bottom: 1rem; }
+    .card h3 { font-size: 1rem; margin: 0 0 0.75rem; color: var(--textMuted); font-weight: 600; }
+    .metrics { display: flex; flex-wrap: wrap; gap: 1.5rem; margin-bottom: 1rem; }
+    .metric { background: var(--surface2); padding: 0.75rem 1rem; border-radius: 8px; min-width: 120px; }
+    .metric .label { font-size: 0.75rem; color: var(--textMuted); text-transform: uppercase; letter-spacing: 0.05em; }
+    .metric .value { font-size: 1.25rem; font-weight: 700; color: var(--accent); font-family: var(--fontMono); }
+    table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+    th, td { text-align: left; padding: 0.6rem 0.75rem; border-bottom: 1px solid var(--border); }
+    th { color: var(--textMuted); font-weight: 600; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; }
+    tr:hover { background: var(--surface2); }
+    .badge { display: inline-block; padding: 0.2rem 0.5rem; border-radius: 6px; font-size: 0.75rem; font-weight: 600; }
+    .badge--high { background: rgba(74, 222, 128, 0.2); color: var(--success); }
+    .badge--mid { background: rgba(251, 191, 36, 0.2); color: var(--warn); }
+    .badge--low { background: rgba(248, 113, 113, 0.2); color: var(--error); }
+    .form-row { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; margin-bottom: 1rem; }
+    input[type="text"], input[type="number"] { background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 0.5rem 0.75rem; color: var(--text); font-family: var(--fontMono); font-size: 0.9rem; min-width: 200px; }
+    input::placeholder { color: var(--textMuted); }
+    button { background: var(--accentDim); color: var(--bg); border: none; border-radius: 8px; padding: 0.5rem 1rem; font-weight: 600; font-size: 0.9rem; cursor: pointer; }
+    button:hover { background: var(--accent); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .loading { color: var(--textMuted); font-style: italic; }
+    .err { color: var(--error); }
+    .success { color: var(--success); }
+    .eq-wrap { height: 220px; background: var(--surface2); border-radius: 8px; padding: 0.5rem; margin-top: 0.5rem; }
+    .eq-wrap canvas { width: 100%; height: 100%; display: block; }
+    .analysis-block { margin-bottom: 1rem; }
+    .analysis-block .k { color: var(--textMuted); font-size: 0.8rem; }
+    .analysis-block .v { font-family: var(--fontMono); margin-top: 0.25rem; }
+    .health-status { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.35rem 0.75rem; border-radius: 8px; background: rgba(74, 222, 128, 0.15); color: var(--success); font-weight: 600; }
+    .health-status.down { background: rgba(248, 113, 113, 0.15); color: var(--error); }
+    pre { background: var(--surface2); padding: 1rem; border-radius: 8px; overflow: auto; font-size: 0.8rem; font-family: var(--fontMono); white-space: pre-wrap; word-break: break-word; max-height: 300px; }
+    .empty { color: var(--textMuted); padding: 1.5rem; text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <h1>Stock Scanner API</h1>
+      <nav class="nav">
+        <a href="#" class="nav-link active" data-page="health">Health</a>
+        <a href="#" class="nav-link" data-page="scan">Scan Stocks</a>
+        <a href="#" class="nav-link" data-page="top-trades">Top Trades</a>
+        <a href="#" class="nav-link" data-page="signals">Signals</a>
+        <a href="#" class="nav-link" data-page="high-confidence">High-Confidence Signals</a>
+        <a href="#" class="nav-link" data-page="stock-analysis">Stock Analysis</a>
+        <a href="#" class="nav-link" data-page="backtest">Backtest Results</a>
+        <a href="#" class="nav-link" data-page="model">Model Performance</a>
+      </nav>
+    </aside>
+    <main class="main">
+      <div id="page-health" class="page active">
+        <h2>Health</h2>
+        <p class="sub">API and service status</p>
+        <div id="health-card" class="card"><span class="loading">Loading…</span></div>
+      </div>
+
+      <div id="page-scan" class="page">
+        <h2>Scan Stocks</h2>
+        <p class="sub">Run a scan on specific symbols or full universe (NIFTY). Full-universe scan is capped to avoid long runs (default 50 symbols).</p>
+        <div class="card">
+          <div class="form-row">
+            <input type="text" id="scan-symbols" placeholder="RELIANCE, TCS, INFY (leave empty for universe)" />
+            <label style="color: var(--textMuted);">Max symbols (universe only):</label>
+            <input type="number" id="scan-max-symbols" value="50" min="1" max="500" style="min-width: 70px;" title="When no symbols entered, scan only first N from universe" />
+            <button id="btn-scan">Run Scan</button>
+          </div>
+          <div id="scan-result"></div>
+        </div>
+      </div>
+
+      <div id="page-top-trades" class="page">
+        <h2>Top Trades</h2>
+        <p class="sub">Highest-probability stored signals</p>
+        <div class="form-row">
+          <label>Limit</label>
+          <input type="number" id="top-trades-limit" value="15" min="1" max="100" style="min-width: 80px;" />
+          <button id="btn-top-trades">Refresh</button>
+        </div>
+        <div id="top-trades-card" class="card"><span class="loading">Loading…</span></div>
+      </div>
+
+      <div id="page-signals" class="page">
+        <h2>Signals</h2>
+        <p class="sub">All stored signals (latest first)</p>
+        <div class="form-row">
+          <label>Limit</label>
+          <input type="number" id="signals-limit" value="50" min="1" max="200" style="min-width: 80px;" />
+          <button id="btn-signals">Refresh</button>
+        </div>
+        <div id="signals-card" class="card"><span class="loading">Loading…</span></div>
+      </div>
+
+      <div id="page-high-confidence" class="page">
+        <h2>High-Confidence Signals</h2>
+        <p class="sub">Signals that passed all filters (ML + technical + fundamental)</p>
+        <div class="form-row">
+          <label>Limit</label>
+          <input type="number" id="high-conf-limit" value="30" min="1" max="200" style="min-width: 80px;" />
+          <button id="btn-high-conf">Refresh</button>
+        </div>
+        <div id="high-conf-card" class="card"><span class="loading">Loading…</span></div>
+      </div>
+
+      <div id="page-stock-analysis" class="page">
+        <h2>Stock Analysis</h2>
+        <p class="sub">Live analysis for a single symbol: technicals, patterns, ML score, AI explanation</p>
+        <div class="card">
+          <div class="form-row">
+            <input type="text" id="analysis-symbol" placeholder="e.g. RELIANCE" />
+            <button id="btn-analysis">Analyze</button>
+          </div>
+          <div id="analysis-result"></div>
+        </div>
+      </div>
+
+      <div id="page-backtest" class="page">
+        <h2>Backtest Results</h2>
+        <p class="sub">Historical performance when trading on ML probability &gt; 80%</p>
+        <div class="form-row">
+          <button id="btn-backtest-cache">Use cache</button>
+          <button id="btn-backtest-fresh">Refresh (recompute)</button>
+        </div>
+        <div id="backtest-card" class="card"><span class="loading">Loading…</span></div>
+        <div class="card">
+          <h3>Equity curve</h3>
+          <div class="eq-wrap"><canvas id="eqCanvas"></canvas></div>
+        </div>
+      </div>
+
+      <div id="page-model" class="page">
+        <h2>Model Performance</h2>
+        <p class="sub">Best model metrics (validation &amp; test)</p>
+        <div id="model-card" class="card"><span class="loading">Loading…</span></div>
+      </div>
+    </main>
+  </div>
+
+  <script>
+    const API = '/api/v1';
+
+    async function apiGet(url, opts = {}) {
+      const r = await fetch(API + url, opts);
+      if (!r.ok) throw new Error(r.status + ' ' + r.statusText);
+      return r.json();
+    }
+
+    function esc(s) {
+      const d = document.createElement('div');
+      d.textContent = s == null ? '' : String(s);
+      return d.innerHTML;
+    }
+
+    function badgeClass(pred) {
+      if (!pred) return '';
+      if (pred.toLowerCase().includes('high')) return 'badge--high';
+      if (pred.toLowerCase().includes('medium')) return 'badge--mid';
+      return 'badge--low';
+    }
+
+    // Navigation — reload data when switching pages
+    const pageLoaders = {
+      'health': loadHealth,
+      'top-trades': loadTopTrades,
+      'signals': loadSignals,
+      'high-confidence': loadHighConf,
+      'backtest': () => loadBacktest(true),
+      'model': loadModel,
+    };
+    document.querySelectorAll('.nav-link').forEach(a => {
+      a.addEventListener('click', e => {
+        e.preventDefault();
+        document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));
+        document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+        a.classList.add('active');
+        const pageName = a.dataset.page;
+        const page = document.getElementById('page-' + pageName);
+        if (page) page.classList.add('active');
+        const loader = pageLoaders[pageName];
+        if (loader) loader();
+      });
+    });
+
+    // Health
+    async function loadHealth() {
+      const el = document.getElementById('health-card');
+      try {
+        const d = await apiGet('/health');
+        el.innerHTML = `
+          <div class="metrics">
+            <div class="metric"><div class="label">Status</div><div class="value"><span class="health-status">${d.status === 'UP' ? '● UP' : '● DOWN'}</span></div></div>
+            <div class="metric"><div class="label">App</div><div class="value">${esc(d.app)}</div></div>
+            <div class="metric"><div class="label">Env</div><div class="value">${esc(d.env)}</div></div>
+          </div>
+        `;
+        if (d.status !== 'UP') document.querySelector('.health-status').classList.add('down');
+      } catch (e) {
+        el.innerHTML = '<p class="err">Failed: ' + esc(e.message) + '</p>';
+      }
+    }
+
+    // Scan
+    document.getElementById('btn-scan').addEventListener('click', async () => {
+      const resultEl = document.getElementById('scan-result');
+      const symbols = document.getElementById('scan-symbols').value.trim();
+      resultEl.innerHTML = '<span class="loading">Scanning…</span>';
+      try {
+        const maxSyms = document.getElementById('scan-max-symbols').value || 50;
+        const url = symbols ? '/scan-stocks?symbols=' + encodeURIComponent(symbols) : ('/scan-stocks?max_symbols=' + maxSyms);
+        const d = await apiGet(url);
+        let html = '<div class="metrics">';
+        html += '<div class="metric"><div class="label">Scanned</div><div class="value">' + (d.scanned_symbols ?? 0) + '</div></div>';
+        if (d.universe_size != null) html += '<div class="metric"><div class="label">Universe size</div><div class="value">' + d.universe_size + '</div></div>';
+        if (d.max_symbols_cap != null) html += '<div class="metric"><div class="label">Cap used</div><div class="value">' + d.max_symbols_cap + '</div></div>';
+        html += '<div class="metric"><div class="label">High probability</div><div class="value">' + (d.high_probability_count ?? 0) + '</div></div>';
+        if (d.watchlist_count != null) html += '<div class="metric"><div class="label">Watchlist</div><div class="value">' + d.watchlist_count + '</div></div>';
+        html += '</div>';
+        const list = d.high_probability || [];
+        if (list.length) {
+          html += '<h3>High-probability setups</h3><table><tr><th>Symbol</th><th>Entry</th><th>Stop</th><th>Target</th><th>Score</th><th>Model</th><th>Trend</th></tr>';
+          list.forEach(t => {
+            html += '<tr><td>' + esc(t.symbol) + '</td><td>' + Number(t.entry_price).toFixed(2) + '</td><td>' + Number(t.stop_loss).toFixed(2) + '</td><td>' + Number(t.target_1 || t.target).toFixed(2) + '</td><td>' + (t.probability_score ?? t.signal_strength ?? '–') + '</td><td><span class="badge ' + badgeClass(t.model_prediction) + '">' + esc(t.model_prediction || 'N/A') + '</span></td><td>' + esc(t.trend || t.ema_status) + '</td></tr>';
+          });
+          html += '</table>';
+        } else {
+          html += '<p class="empty">No high-probability setups. Try different symbols or run full universe scan.</p>';
+        }
+        if (d.watchlist && d.watchlist.length) {
+          html += '<h3>Watchlist</h3><table><tr><th>Symbol</th><th>Entry</th><th>Score</th></tr>';
+          d.watchlist.slice(0, 10).forEach(t => {
+            html += '<tr><td>' + esc(t.symbol) + '</td><td>' + Number(t.entry_price).toFixed(2) + '</td><td>' + (t.probability_score ?? '–') + '</td></tr>';
+          });
+          html += '</table>';
+        }
+        resultEl.innerHTML = html;
+      } catch (e) {
+        resultEl.innerHTML = '<p class="err">' + esc(e.message) + '</p>';
+      }
+    });
+
+    // Top Trades
+    async function loadTopTrades() {
+      const el = document.getElementById('top-trades-card');
+      const limit = document.getElementById('top-trades-limit').value || 15;
+      try {
+        const data = await apiGet('/top-trades?limit=' + limit);
+        if (!Array.isArray(data) || !data.length) {
+          el.innerHTML = '<p class="empty">No trades stored. Run a scan first.</p>';
+          return;
+        }
+        let table = '<table><tr><th>Symbol</th><th>Entry</th><th>Stop</th><th>Target</th><th>Score</th><th>Model</th><th>Trend</th><th>AI summary</th></tr>';
+        data.forEach(t => {
+          const target = t.target != null ? t.target : t.target_1;
+          table += '<tr><td>' + esc(t.symbol) + '</td><td>' + Number(t.entry_price).toFixed(2) + '</td><td>' + Number(t.stop_loss).toFixed(2) + '</td><td>' + Number(target).toFixed(2) + '</td><td>' + (t.probability_score ?? '–') + '</td><td><span class="badge ' + badgeClass(t.model_prediction) + '">' + esc(t.model_prediction || 'N/A') + '</span></td><td>' + esc(t.trend || t.ema_status) + '</td><td>' + esc((t.ai_analysis || '').slice(0, 60)) + (t.ai_analysis && t.ai_analysis.length > 60 ? '…' : '') + '</td></tr>';
+        });
+        table += '</table>';
+        el.innerHTML = table;
+      } catch (e) {
+        el.innerHTML = '<p class="err">' + esc(e.message) + '</p>';
+      }
+    }
+    document.getElementById('btn-top-trades').addEventListener('click', loadTopTrades);
+
+    // Signals
+    async function loadSignals() {
+      const el = document.getElementById('signals-card');
+      const limit = document.getElementById('signals-limit').value || 50;
+      try {
+        const data = await apiGet('/signals?limit=' + limit);
+        if (!Array.isArray(data) || !data.length) {
+          el.innerHTML = '<p class="empty">No signals.</p>';
+          return;
+        }
+        let table = '<table><tr><th>Stock</th><th>Entry</th><th>Stop</th><th>Target 1</th><th>Strength</th><th>Pattern</th><th>Time</th></tr>';
+        data.forEach(s => {
+          table += '<tr><td>' + esc(s.stock) + '</td><td>' + Number(s.entry_price).toFixed(2) + '</td><td>' + Number(s.stop_loss).toFixed(2) + '</td><td>' + Number(s.target_1).toFixed(2) + '</td><td>' + (s.signal_strength ?? '–') + '</td><td>' + esc(s.pattern_detected) + '</td><td>' + esc(s.signal_time ? new Date(s.signal_time).toLocaleString() : '') + '</td></tr>';
+        });
+        table += '</table>';
+        el.innerHTML = table;
+      } catch (e) {
+        el.innerHTML = '<p class="err">' + esc(e.message) + '</p>';
+      }
+    }
+    document.getElementById('btn-signals').addEventListener('click', loadSignals);
+
+    // High-confidence signals
+    async function loadHighConf() {
+      const el = document.getElementById('high-conf-card');
+      const limit = document.getElementById('high-conf-limit').value || 30;
+      try {
+        const data = await apiGet('/signals/high-confidence?limit=' + limit);
+        if (!Array.isArray(data) || !data.length) {
+          el.innerHTML = '<p class="empty">No high-confidence signals.</p>';
+          return;
+        }
+        let table = '<table><tr><th>Stock</th><th>Entry</th><th>Stop</th><th>Target 1</th><th>Strength</th><th>Pattern</th><th>Time</th></tr>';
+        data.forEach(s => {
+          table += '<tr><td>' + esc(s.stock) + '</td><td>' + Number(s.entry_price).toFixed(2) + '</td><td>' + Number(s.stop_loss).toFixed(2) + '</td><td>' + Number(s.target_1).toFixed(2) + '</td><td>' + (s.signal_strength ?? '–') + '</td><td>' + esc(s.pattern_detected) + '</td><td>' + esc(s.signal_time ? new Date(s.signal_time).toLocaleString() : '') + '</td></tr>';
+        });
+        table += '</table>';
+        el.innerHTML = table;
+      } catch (e) {
+        el.innerHTML = '<p class="err">' + esc(e.message) + '</p>';
+      }
+    }
+    document.getElementById('btn-high-conf').addEventListener('click', loadHighConf);
+
+    // Stock Analysis
+    document.getElementById('btn-analysis').addEventListener('click', async () => {
+      const resultEl = document.getElementById('analysis-result');
+      const symbol = document.getElementById('analysis-symbol').value.trim();
+      if (!symbol) {
+        resultEl.innerHTML = '<p class="err">Enter a symbol.</p>';
+        return;
+      }
+      resultEl.innerHTML = '<span class="loading">Analyzing…</span>';
+      try {
+        const d = await apiGet('/stock-analysis/' + encodeURIComponent(symbol.toUpperCase()));
+        if (d.message && !d.entry_price) {
+          resultEl.innerHTML = '<p class="err">' + esc(d.message) + '</p>';
+          return;
+        }
+        let html = '<div class="metrics">';
+        html += '<div class="metric"><div class="label">Entry</div><div class="value">' + Number(d.entry_price || 0).toFixed(2) + '</div></div>';
+        html += '<div class="metric"><div class="label">Stop loss</div><div class="value">' + Number(d.stop_loss || 0).toFixed(2) + '</div></div>';
+        html += '<div class="metric"><div class="label">Target 1</div><div class="value">' + Number(d.target_1 || 0).toFixed(2) + '</div></div>';
+        html += '<div class="metric"><div class="label">Probability</div><div class="value">' + (d.probability_score ?? '–') + '</div></div>';
+        html += '<div class="metric"><div class="label">High probability</div><div class="value">' + (d.is_high_probability ? 'Yes' : 'No') + '</div></div>';
+        html += '</div>';
+        html += '<div class="analysis-block"><div class="k">Trend</div><div class="v">' + esc(d.trend) + '</div></div>';
+        html += '<div class="analysis-block"><div class="k">Pattern</div><div class="v">' + esc(d.pattern) + '</div></div>';
+        html += '<div class="analysis-block"><div class="k">Scores (Technical / Fundamental / AI)</div><div class="v">' + esc(d.total_score) + ' / ' + esc(d.fundamental_score) + ' / ' + esc(d.ai_sentiment_score) + '</div></div>';
+        if (d.ai_analysis) html += '<div class="analysis-block"><div class="k">AI analysis</div><div class="v">' + esc(d.ai_analysis) + '</div></div>';
+        resultEl.innerHTML = html;
+      } catch (e) {
+        resultEl.innerHTML = '<p class="err">' + esc(e.message) + '</p>';
+      }
+    });
+
+    // Backtest
+    let _pendingCurve = null;
+
+    function _drawCurveNow(curve) {
+      const canvas = document.getElementById('eqCanvas');
+      if (!canvas || !curve || curve.length < 2) return;
+      const dpr = window.devicePixelRatio || 1;
+      const w = canvas.offsetWidth || canvas.parentElement.offsetWidth || 600;
+      const h = canvas.offsetHeight || canvas.parentElement.offsetHeight || 200;
+      if (w < 10 || h < 10) return;
+      canvas.width = w * dpr;
+      canvas.height = h * dpr;
+      const ctx = canvas.getContext('2d');
+      ctx.scale(dpr, dpr);
+      ctx.fillStyle = '#1c1c22';
+      ctx.fillRect(0, 0, w, h);
+      const min = Math.min(...curve);
+      const max = Math.max(...curve);
+      const range = max - min || 1;
+      ctx.strokeStyle = '#22d3ee';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      curve.forEach((y, i) => {
+        const x = (i / (curve.length - 1)) * (w - 4) + 2;
+        const ny = h - 4 - ((y - min) / range) * (h - 8);
+        if (i === 0) ctx.moveTo(x, ny);
+        else ctx.lineTo(x, ny);
+      });
+      ctx.stroke();
+      _pendingCurve = null;
+    }
+
+    function drawEquityCurve(curve) {
+      _pendingCurve = curve;
+      requestAnimationFrame(() => setTimeout(() => _drawCurveNow(_pendingCurve || curve), 50));
+    }
+
+    let _lastBacktestData = null;
+
+    async function loadBacktest(useCache = true) {
+      const el = document.getElementById('backtest-card');
+      el.innerHTML = '<span class="loading">Loading…</span>';
+      try {
+        const data = await apiGet('/backtest-results?use_cache=' + useCache);
+        _lastBacktestData = data;
+        let html = '<div class="metrics">';
+        html += '<div class="metric"><div class="label">Win rate</div><div class="value">' + (data.win_rate_pct != null ? data.win_rate_pct + '%' : '–') + '</div></div>';
+        html += '<div class="metric"><div class="label">Profit factor</div><div class="value">' + (data.profit_factor ?? '–') + '</div></div>';
+        html += '<div class="metric"><div class="label">Avg return/trade</div><div class="value">' + (data.avg_return_pct != null ? data.avg_return_pct + '%' : '–') + '</div></div>';
+        html += '<div class="metric"><div class="label">Max drawdown</div><div class="value">' + (data.max_drawdown_pct != null ? data.max_drawdown_pct + '%' : '–') + '</div></div>';
+        html += '<div class="metric"><div class="label">Sharpe</div><div class="value">' + (data.sharpe_ratio ?? '–') + '</div></div>';
+        html += '<div class="metric"><div class="label">Risk/reward</div><div class="value">' + (data.risk_reward_ratio ?? '–') + '</div></div>';
+        if (data.total_trades != null) html += '<div class="metric"><div class="label">Trades</div><div class="value">' + data.total_trades + '</div></div>';
+        if (data.wins != null) html += '<div class="metric"><div class="label">Wins</div><div class="value">' + data.wins + '</div></div>';
+        if (data.losses != null) html += '<div class="metric"><div class="label">Losses</div><div class="value">' + data.losses + '</div></div>';
+        if (data.symbols_backtested != null) html += '<div class="metric"><div class="label">Symbols tested</div><div class="value">' + data.symbols_backtested + '</div></div>';
+        html += '</div>';
+        if (data.message) html += '<p class="loading">' + esc(data.message) + '</p>';
+        el.innerHTML = html;
+        drawEquityCurve(data.equity_curve || []);
+      } catch (e) {
+        el.innerHTML = '<p class="err">' + esc(e.message) + '</p>';
+      }
+    }
+    document.getElementById('btn-backtest-cache').addEventListener('click', () => loadBacktest(true));
+    document.getElementById('btn-backtest-fresh').addEventListener('click', () => loadBacktest(false));
+
+    // Model performance
+    async function loadModel() {
+      const el = document.getElementById('model-card');
+      try {
+        const data = await apiGet('/model-performance');
+        if (!data.model_available) {
+          el.innerHTML = '<p class="loading">' + esc(data.message || 'No model trained. Run scripts/train_models.py first.') + '</p>';
+          return;
+        }
+        const v = data.validation || {};
+        const t = data.test || {};
+        let html = '<div class="metrics"><div class="metric"><div class="label">Best model</div><div class="value">' + esc(data.best_model) + '</div></div></div>';
+        html += '<h3>Validation</h3><div class="metrics">';
+        ['accuracy', 'precision', 'recall', 'f1', 'roc_auc'].forEach(k => {
+          const val = v[k];
+          html += '<div class="metric"><div class="label">' + k + '</div><div class="value">' + (val != null ? (typeof val === 'number' ? val.toFixed(4) : val) : '–') + '</div></div>';
+        });
+        html += '</div><h3>Test</h3><div class="metrics">';
+        ['accuracy', 'precision', 'recall', 'f1', 'roc_auc'].forEach(k => {
+          const val = t[k];
+          html += '<div class="metric"><div class="label">' + k + '</div><div class="value">' + (val != null ? (typeof val === 'number' ? val.toFixed(4) : val) : '–') + '</div></div>';
+        });
+        html += '</div>';
+        el.innerHTML = html;
+      } catch (e) {
+        el.innerHTML = '<p class="err">' + esc(e.message) + '</p>';
+      }
+    }
+
+    // Initial load — only fetch data for visible page; others load on nav click
+    (async function init() {
+      await loadHealth();
+      loadTopTrades();
+      loadModel();
+    })();
+  </script>
+</body>
+</html>

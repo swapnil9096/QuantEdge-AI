@@ -1,0 +1,39 @@
+# Never ship these into the container — they're either dev-only, secrets, or huge.
+
+# Virtualenvs
+**/.venv/
+**/venv/
+**/.tox/
+
+# Python caches
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+
+# Node / frontend build artefacts (we rebuild inside the container)
+frontend/node_modules/
+frontend/dist/
+
+# macOS / IDE cruft
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Logs / runtime data — volumes handle these at runtime
+backend/data/*.db
+backend/data/*.db-*
+backend/data/
+
+# Git metadata — don't need it in the image
+.git/
+.github/
+.gitignore
+.gitattributes
+
+# Local dev files that aren't needed in the image
+**/.env.local
+**/*.log
+nohup.out

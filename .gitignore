@@ -1,0 +1,58 @@
+# --- Secrets ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+**/credentials.json
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+*.sqlite
+*.db
+
+# --- QuantEdge AI runtime data (SQLite DB, equity curve cache, etc.) ---
+# These files are recreated by the app at runtime on the host. Never push them.
+quantedge-ai/backend/data/
+quantedge-ai/backend/data/*.db
+quantedge-ai/backend/data/*.db-*
+quantedge-ai/frontend/dist/
+quantedge-ai/frontend/node_modules/
+
+# --- ML / data artifacts ---
+stock_scanner_api/data/processed/*.parquet
+stock_scanner_api/data/features/*.parquet
+stock_scanner_api/data/models/*.joblib
+stock_scanner_api/data/models/*.json
+stock_scanner_api/data/models/*.txt
+stock_scanner_api/data/backtest_results.json
+
+# --- Java / Maven (legacy) ---
+target/
+*.class
+*.jar
+*.war
+*.log
+.mvn/
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# --- Docker / misc ---
+.docker/

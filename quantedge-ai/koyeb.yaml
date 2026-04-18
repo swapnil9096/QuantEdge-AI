@@ -1,0 +1,82 @@
+# Koyeb service definition for QuantEdge AI.
+#
+# You can use this with:
+#   koyeb service create --app quantedge --from-file koyeb.yaml
+#
+# ...OR set the same values via the Koyeb dashboard — the YAML is just a
+# convenient source of truth. See HOSTING.md for the dashboard walk-through.
+
+name: quantedge
+type: web
+
+# Free "Eco" instance: 512 MB RAM, 0.1 vCPU, always-on, 1 replica.
+instance_type: eco
+scalings:
+  min: 1
+  max: 1
+
+# Closest free-tier region to India.
+# Options if you prefer: was (US-East), sin (Singapore), fra (Frankfurt).
+regions:
+  - fra
+
+# The Docker build comes from this repo's Dockerfile at the root of quantedge-ai/.
+# Koyeb watches the branch and rebuilds automatically on every push.
+git:
+  branch: main
+  build_command: ""
+  run_command: ""
+dockerfile: Dockerfile
+
+# Single HTTP port; Koyeb fronts it with HTTPS automatically.
+ports:
+  - port: 8000
+    protocol: http
+routes:
+  - path: /
+    port: 8000
+
+# Health probe — same /health endpoint used by Fly + the existing local stack.
+health_checks:
+  - grace_period: 30s
+    interval: 30s
+    timeout: 10s
+    http:
+      path: /health
+      port: 8000
+
+# Persistent volume so the SQLite DB, paper trades, and history survive deploys
+# (free tier includes up to 3 GB of volume storage). The Dockerfile creates
+# /app/backend/data at build time; Koyeb mounts over it.
+volumes:
+  - name: quantedge-data
+    path: /app/backend/data
+    size: 1
+
+env:
+  - key: APP_ENV
+    value: production
+  - key: LOG_LEVEL
+    value: INFO
+  - key: SESSION_TTL_HOURS
+    value: "24"
+  - key: PORT
+    value: "8000"
+  - key: PAPER_CAPITAL
+    value: "1000000"
+  - key: PAPER_RISK_PCT
+    value: "2.0"
+  - key: PAPER_MAX_OPEN
+    value: "5"
+  - key: PAPER_MAX_HOLD_DAYS
+    value: "20"
+  - key: PAPER_MONITOR_INTERVAL
+    value: "60"
+  - key: AUTO_PAPER_TRADE_ENABLED
+    value: "true"
+  - key: AUTO_PAPER_TRADE_THRESHOLD
+    value: "70"
+  - key: AUTO_TRADE_MARKET_OPEN_ONLY
+    value: "false"
+  - key: TELEGRAM_CHAT_ID
+    value: "1681623488"

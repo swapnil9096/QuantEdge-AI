@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Real-Time Stock Streaming Test</title>
+    <script src="https://cdn.jsdelivr.net/npm/sockjs-client@1/dist/sockjs.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/stompjs@2.3.3/lib/stomp.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .stock-card { border: 1px solid #ddd; margin: 10px; padding: 15px; border-radius: 5px; display: inline-block; width: 300px; }
+        .price { font-size: 24px; font-weight: bold; }
+        .positive { color: green; }
+        .negative { color: red; }
+        .controls { margin: 20px 0; }
+        .controls input, .controls button { margin: 5px; padding: 8px; }
+        .status { padding: 10px; margin: 10px 0; border-radius: 5px; }
+        .connected { background-color: #d4edda; color: #155724; }
+        .disconnected { background-color: #f8d7da; color: #721c24; }
+        .data-source { font-size: 12px; color: #666; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Real-Time Stock Data Streaming</h1>
+        
+        <div class="controls">
+            <input type="text" id="symbolInput" placeholder="Enter stock symbol (e.g., IRCTC)" value="IRCTC">
+            <button onclick="subscribeToStock()">Subscribe</button>
+            <button onclick="unsubscribeAll()">Unsubscribe All</button>
+            <button onclick="connect()">Connect</button>
+            <button onclick="disconnect()">Disconnect</button>
+        </div>
+        
+        <div id="status" class="status disconnected">Disconnected</div>
+        
+        <div id="stocksContainer"></div>
+    </div>
+
+    <script>
+        let stompClient = null;
+        let subscriptions = new Map();
+        
+        function connect() {
+            const socket = new SockJS('/ws');
+            stompClient = Stomp.over(socket);
+            stompClient.debug = null; // Disable debug messages
+            
+            stompClient.connect({}, function (frame) {
+                console.log('Connected: ' + frame);
+                updateStatus('Connected', true);
+            }, function (error) {
+                console.log('Connection error: ' + error);
+                updateStatus('Connection failed', false);
+            });
+        }
+        
+        function disconnect() {
+            if (stompClient !== null) {
+                stompClient.disconnect();
+                updateStatus('Disconnected', false);
+            }
+        }
+        
+        function subscribeToStock() {
+            const symbol = document.getElementById('symbolInput').value.toUpperCase();
+            if (!symbol) {
+                alert('Please enter a stock symbol');
+                return;
+            }
+            
+            if (stompClient === null || !stompClient.connected) {
+                alert('Please connect first');
+                return;
+            }
+            
+            // Unsubscribe if already subscribed
+            if (subscriptions.has(symbol)) {
+                subscriptions.get(symbol).unsubscribe();
+                subscriptions.delete(symbol);
+                removeStockCard(symbol);
+            }
+            
+            // Subscribe to the stock
+            const subscription = stompClient.subscribe('/topic/quotes/' + symbol, function (message) {
+                const data = JSON.parse(message.body);
+                updateStockCard(data);
+            });
+            
+            subscriptions.set(symbol, subscription);
+            console.log('Subscribed to: ' + symbol);
+        }
+        
+        function unsubscribeAll() {
+            subscriptions.forEach((subscription, symbol) => {
+                subscription.unsubscribe();
+                removeStockCard(symbol);
+            });
+            subscriptions.clear();
+        }
+        
+        function updateStockCard(data) {
+            const container = document.getElementById('stocksContainer');
+            let card = document.getElementById('stock-' + data.symbol);
+            
+            if (!card) {
+                card = document.createElement('div');
+                card.id = 'stock-' + data.symbol;
+                card.className = 'stock-card';
+                container.appendChild(card);
+            }
+            
+            const changeClass = data.change >= 0 ? 'positive' : 'negative';
+            const changeSymbol = data.change >= 0 ? '+' : '';
+            
+            card.innerHTML = `
+                <h3>${data.symbol} - ${data.name}</h3>
+                <div class="price ${changeClass}">₹${data.currentPrice}</div>
+                <div class="${changeClass}">${changeSymbol}${data.change} (${changeSymbol}${data.changePercent}%)</div>
+                <div>Open: ₹${data.open}</div>
+                <div>High: ₹${data.high}</div>
+                <div>Low: ₹${data.low}</div>
+                <div>Volume: ${data.volume}</div>
+                <div>Exchange: ${data.exchange}</div>
+                <div>Sector: ${data.sector}</div>
+                <div>Cap: ${data.cap}</div>
+                <div class="data-source">Last Updated: ${new Date(data.lastUpdated).toLocaleTimeString()}</div>
+            `;
+        }
+        
+        function removeStockCard(symbol) {
+            const card = document.getElementById('stock-' + symbol);
+            if (card) {
+                card.remove();
+            }
+        }
+        
+        function updateStatus(message, connected) {
+            const status = document.getElementById('status');
+            status.textContent = message;
+            status.className = connected ? 'status connected' : 'status disconnected';
+        }
+        
+        // Auto-connect on page load
+        window.onload = function() {
+            connect();
+        };
+    </script>
+</body>
+</html>
