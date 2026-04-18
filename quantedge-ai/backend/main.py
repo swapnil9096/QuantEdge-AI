@@ -49,7 +49,7 @@ import httpx
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -93,6 +93,12 @@ PORTKEY_CONFIG = os.getenv("PORTKEY_CONFIG", "")  # optional Portkey config id
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
+# Angel One SmartAPI — secrets live in vault, loaded by _reload_secret_globals.
+ANGEL_CLIENT_ID = os.getenv("ANGEL_CLIENT_ID", "")
+ANGEL_PASSWORD = os.getenv("ANGEL_PASSWORD", "")
+ANGEL_TOTP_SECRET = os.getenv("ANGEL_TOTP_SECRET", "")
+ANGEL_API_KEY = os.getenv("ANGEL_API_KEY", "")
+
 
 # ---------------------------------------------------------------------------
 # Secrets vault (encrypted at rest, password-unlocked at runtime)
@@ -126,6 +132,10 @@ SECRET_KEYS: list[str] = [
     "PORTKEY_VIRTUAL_KEY",
     "PORTKEY_CONFIG",
     "TELEGRAM_BOT_TOKEN",
+    "ANGEL_CLIENT_ID",
+    "ANGEL_PASSWORD",
+    "ANGEL_TOTP_SECRET",
+    "ANGEL_API_KEY",
 ]
 
 # API-handled paths that REQUIRE auth by default. Anything not in this set
@@ -150,6 +160,10 @@ _API_PATH_PREFIXES: tuple[str, ...] = (
     "/telegram-test",
     "/scan-best-stock",
     "/high-probability-scan",
+    "/broker/",
+    "/broker",
+    "/train-ml",
+    "/ws/",
     "/docs",
     "/openapi.json",
     "/redoc",
@@ -284,6 +298,7 @@ def _reload_secret_globals(d: dict[str, str]) -> None:
     global OPENAI_API_KEY, ANTHROPIC_API_KEY
     global PORTKEY_API_KEY, PORTKEY_VIRTUAL_KEY, PORTKEY_CONFIG
     global TELEGRAM_BOT_TOKEN
+    global ANGEL_CLIENT_ID, ANGEL_PASSWORD, ANGEL_TOTP_SECRET, ANGEL_API_KEY
     TWELVEDATA_API_KEY = d.get("TWELVEDATA_API_KEY", "")
     ALPHA_VANTAGE_API_KEY = d.get("ALPHA_VANTAGE_API_KEY", "")
     POLYGON_API_KEY = d.get("POLYGON_API_KEY", "")
@@ -293,6 +308,10 @@ def _reload_secret_globals(d: dict[str, str]) -> None:
     PORTKEY_VIRTUAL_KEY = d.get("PORTKEY_VIRTUAL_KEY", "")
     PORTKEY_CONFIG = d.get("PORTKEY_CONFIG", "")
     TELEGRAM_BOT_TOKEN = d.get("TELEGRAM_BOT_TOKEN", "")
+    ANGEL_CLIENT_ID = d.get("ANGEL_CLIENT_ID", "")
+    ANGEL_PASSWORD = d.get("ANGEL_PASSWORD", "")
+    ANGEL_TOTP_SECRET = d.get("ANGEL_TOTP_SECRET", "")
+    ANGEL_API_KEY = d.get("ANGEL_API_KEY", "")
 
 
 def _issue_session_token() -> dict[str, Any]:
@@ -2114,7 +2133,7 @@ PAPER_CAPITAL_INR: float = float(os.getenv("PAPER_CAPITAL", "1000000"))  # ₹10
 PAPER_RISK_PER_TRADE_PCT: float = float(os.getenv("PAPER_RISK_PCT", "2.0"))
 PAPER_MAX_OPEN_POSITIONS: int = int(os.getenv("PAPER_MAX_OPEN", "5"))
 PAPER_MAX_HOLD_DAYS: int = int(os.getenv("PAPER_MAX_HOLD_DAYS", "20"))
-PAPER_MONITOR_INTERVAL_SECONDS: int = int(os.getenv("PAPER_MONITOR_INTERVAL", "60"))
+PAPER_MONITOR_INTERVAL_SECONDS: int = int(os.getenv("PAPER_MONITOR_INTERVAL", "10"))
 
 AUTO_PAPER_TRADE_ENABLED: bool = os.getenv("AUTO_PAPER_TRADE_ENABLED", "true").lower() in {"1", "true", "yes"}
 AUTO_PAPER_TRADE_THRESHOLD: int = int(os.getenv("AUTO_PAPER_TRADE_THRESHOLD", "70"))
@@ -2569,6 +2588,64 @@ def _init_paper_schema() -> None:
 
 
 _init_paper_schema()
+
+
+# ---------------------------------------------------------------------------
+# ML Training schema
+# ---------------------------------------------------------------------------
+
+
+def _init_ml_schema() -> None:
+    with _db_lock, _db_connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ml_training_runs (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                trained_at      TEXT    NOT NULL,
+                symbols_used    INTEGER NOT NULL,
+                dataset_size    INTEGER NOT NULL,
+                training_period TEXT    NOT NULL,
+                best_model      TEXT    NOT NULL,
+                best_auc        REAL    NOT NULL,
+                payload         TEXT    NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ml_trained_at ON ml_training_runs(trained_at DESC)"
+        )
+
+
+_init_ml_schema()
+
+
+def _init_broker_schema() -> None:
+    with _db_lock, _db_connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS broker_orders (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                paper_trade_id INTEGER,
+                order_id       TEXT,
+                symbol         TEXT    NOT NULL,
+                exchange       TEXT    NOT NULL DEFAULT 'NSE',
+                side           TEXT    NOT NULL,
+                qty            INTEGER NOT NULL,
+                price          REAL,
+                order_type     TEXT    NOT NULL,
+                status         TEXT,
+                placed_at      TEXT    NOT NULL,
+                updated_at     TEXT,
+                response       TEXT
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_broker_placed ON broker_orders(placed_at DESC)"
+        )
+
+
+_init_broker_schema()
 
 
 # ---- Helpers -------------------------------------------------------------
@@ -3159,6 +3236,148 @@ async def _monitor_open_positions_once() -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# WebSocket live price streaming (Phase 3)
+# ---------------------------------------------------------------------------
+
+WS_POLL_INTERVAL_SECONDS: int = int(os.getenv("WS_POLL_INTERVAL", "5"))
+
+
+class PriceStreamManager:
+    """Manages WebSocket connections subscribed to real-time price symbols."""
+
+    def __init__(self) -> None:
+        # symbol -> set of WebSocket connections
+        self._subs: dict[str, set[WebSocket]] = {}
+        # ws -> set of symbols it subscribed to
+        self._ws_symbols: dict[int, set[str]] = {}
+        self._lock = asyncio.Lock()
+
+    async def connect(self, ws: WebSocket, symbols: list[str]) -> None:
+        async with self._lock:
+            ws_id = id(ws)
+            if ws_id not in self._ws_symbols:
+                self._ws_symbols[ws_id] = set()
+            for sym in symbols:
+                sym = sym.upper()
+                self._subs.setdefault(sym, set()).add(ws)
+                self._ws_symbols[ws_id].add(sym)
+
+    async def unsubscribe(self, ws: WebSocket, symbols: list[str]) -> None:
+        async with self._lock:
+            ws_id = id(ws)
+            for sym in symbols:
+                sym = sym.upper()
+                if sym in self._subs:
+                    self._subs[sym].discard(ws)
+                    if not self._subs[sym]:
+                        del self._subs[sym]
+                if ws_id in self._ws_symbols:
+                    self._ws_symbols[ws_id].discard(sym)
+
+    async def disconnect(self, ws: WebSocket) -> None:
+        async with self._lock:
+            ws_id = id(ws)
+            syms = self._ws_symbols.pop(ws_id, set())
+            for sym in syms:
+                if sym in self._subs:
+                    self._subs[sym].discard(ws)
+                    if not self._subs[sym]:
+                        del self._subs[sym]
+
+    def all_symbols(self) -> list[str]:
+        return list(self._subs.keys())
+
+    async def broadcast(self, symbol: str, data: dict[str, Any]) -> None:
+        conns = list(self._subs.get(symbol, set()))
+        dead: list[WebSocket] = []
+        for ws in conns:
+            try:
+                await ws.send_json(data)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            await self.disconnect(ws)
+
+
+_price_stream = PriceStreamManager()
+_price_poll_task: Optional[asyncio.Task] = None
+
+
+async def _price_poll_loop() -> None:
+    """Poll yfinance every WS_POLL_INTERVAL_SECONDS for subscribed symbols and broadcast."""
+    logger.info("WebSocket price poller started (interval=%ds).", WS_POLL_INTERVAL_SECONDS)
+    try:
+        while True:
+            await asyncio.sleep(WS_POLL_INTERVAL_SECONDS)
+            symbols = _price_stream.all_symbols()
+            if not symbols:
+                continue
+            try:
+                import yfinance as yf
+                tickers_str = " ".join(s + ".NS" for s in symbols)
+                data = yf.download(
+                    tickers_str,
+                    period="1d",
+                    interval="1m",
+                    progress=False,
+                    auto_adjust=True,
+                )
+                ts = datetime.now(timezone.utc).isoformat()
+                if data.empty:
+                    continue
+                # yfinance returns a MultiIndex for multiple tickers
+                if isinstance(data.columns, pd.MultiIndex):
+                    for sym in symbols:
+                        ticker = sym + ".NS"
+                        try:
+                            close_col = ("Close", ticker)
+                            if close_col not in data.columns:
+                                continue
+                            prices = data[close_col].dropna()
+                            if prices.empty:
+                                continue
+                            last_price = float(prices.iloc[-1])
+                            open_price = float(data[("Open", ticker)].dropna().iloc[0])
+                            vol = float(data[("Volume", ticker)].dropna().sum())
+                            change_pct = ((last_price - open_price) / open_price * 100) if open_price else 0.0
+                            await _price_stream.broadcast(sym, {
+                                "type":       "price_update",
+                                "symbol":     sym,
+                                "price":      round(last_price, 2),
+                                "change_pct": round(change_pct, 3),
+                                "volume":     int(vol),
+                                "ts":         ts,
+                            })
+                        except Exception as e:
+                            logger.debug("WS price update failed for %s: %s", sym, e)
+                else:
+                    # Single ticker — data.columns is flat
+                    sym = symbols[0]
+                    try:
+                        prices = data["Close"].dropna()
+                        if prices.empty:
+                            continue
+                        last_price = float(prices.iloc[-1])
+                        open_price = float(data["Open"].dropna().iloc[0])
+                        vol = float(data["Volume"].dropna().sum())
+                        change_pct = ((last_price - open_price) / open_price * 100) if open_price else 0.0
+                        await _price_stream.broadcast(sym, {
+                            "type":       "price_update",
+                            "symbol":     sym,
+                            "price":      round(last_price, 2),
+                            "change_pct": round(change_pct, 3),
+                            "volume":     int(vol),
+                            "ts":         ts,
+                        })
+                    except Exception as e:
+                        logger.debug("WS price update failed for %s: %s", sym, e)
+            except Exception as exc:
+                logger.warning("Price poll tick failed: %s", exc)
+    except asyncio.CancelledError:
+        logger.info("WebSocket price poller cancelled.")
+
+
 _monitor_task: Optional[asyncio.Task] = None
 
 
@@ -3181,20 +3400,23 @@ async def _monitor_loop() -> None:
 
 
 @app.on_event("startup")
-async def _start_monitor() -> None:
-    global _monitor_task
+async def _start_background_tasks() -> None:
+    global _monitor_task, _price_poll_task
     if _monitor_task is None or _monitor_task.done():
         _monitor_task = asyncio.create_task(_monitor_loop())
+    if _price_poll_task is None or _price_poll_task.done():
+        _price_poll_task = asyncio.create_task(_price_poll_loop())
 
 
 @app.on_event("shutdown")
-async def _stop_monitor() -> None:
-    if _monitor_task and not _monitor_task.done():
-        _monitor_task.cancel()
-        try:
-            await _monitor_task
-        except asyncio.CancelledError:
-            pass
+async def _stop_background_tasks() -> None:
+    for task in (_monitor_task, _price_poll_task):
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 def _history_stats_sync() -> dict[str, Any]:
@@ -4180,6 +4402,697 @@ async def scan_best_stock() -> ScanResponse:
         scan_timestamp=now_iso,
     )
     return ScanResponse(trade_found=True, result=trade)
+
+
+# ---------------------------------------------------------------------------
+# ML Model Training (Phase 2)
+# ---------------------------------------------------------------------------
+
+# Representative NIFTY 500 symbols for training data when no list is passed
+_ML_DEFAULT_SYMBOLS = [
+    "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK",
+    "HINDUNILVR", "SBIN", "BHARTIARTL", "ITC", "KOTAKBANK",
+    "LT", "AXISBANK", "ASIANPAINT", "WIPRO", "MARUTI",
+    "TITAN", "SUNPHARMA", "BAJFINANCE", "NESTLEIND", "TECHM",
+]
+
+_NIFTY500_TICKERS_FOR_ML = [s + ".NS" for s in _ML_DEFAULT_SYMBOLS]
+
+
+def _ema_series(s: pd.Series, period: int) -> pd.Series:
+    return s.ewm(span=period, adjust=False).mean()
+
+
+def _rsi_series(s: pd.Series, period: int = 14) -> pd.Series:
+    delta = s.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return 100 - 100 / (1 + rs)
+
+
+def _build_ml_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute feature matrix from OHLCV dataframe.
+
+    Returns a DataFrame with features + binary label ``is_profitable`` (1 if
+    forward 20-bar return > 3%, else 0). Drops rows where any feature is NaN.
+    """
+    close = df["Close"].astype(float)
+    high  = df["High"].astype(float)
+    low   = df["Low"].astype(float)
+    vol   = df["Volume"].astype(float)
+
+    ema20  = _ema_series(close, 20)
+    ema50  = _ema_series(close, 50)
+    ema200 = _ema_series(close, 200)
+
+    # MACD
+    exp12 = _ema_series(close, 12)
+    exp26 = _ema_series(close, 26)
+    macd  = exp12 - exp26
+    signal_line = _ema_series(macd, 9)
+    macd_hist = macd - signal_line
+
+    # RSI
+    rsi14 = _rsi_series(close, 14)
+
+    # ATR
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    atr14 = tr.rolling(14).mean()
+    atr_pct = atr14 / close
+
+    # Volume ratio (vs 20-bar average)
+    vol_avg = vol.rolling(20).mean()
+    volume_ratio = vol / vol_avg.replace(0, np.nan)
+
+    # Pattern strength: % above 20-day EMA
+    pattern_strength = (close - ema20) / ema20 * 100
+
+    # Breakout-of-structure flag: new 20-day high
+    bos_flag = (close >= close.rolling(20).max().shift(1)).astype(int)
+
+    # Price vs EMAs
+    price_above_200ema = (close > ema200).astype(int)
+
+    # VWAP estimate (proxy: typical price / typical-price EMA)
+    typical_price = (high + low + close) / 3
+    vwap_est = typical_price.ewm(span=20, adjust=False).mean()
+    vwap_ratio = close / vwap_est
+
+    # MACD above signal
+    macd_above_signal = (macd > signal_line).astype(int)
+
+    feat = pd.DataFrame({
+        "rsi_14":            rsi14,
+        "macd_hist":         macd_hist,
+        "ema_20_50_ratio":   ema20 / ema50,
+        "ema_50_200_ratio":  ema50 / ema200,
+        "volume_ratio":      volume_ratio,
+        "atr_pct":           atr_pct,
+        "pattern_strength":  pattern_strength,
+        "bos_flag":          bos_flag,
+        "price_above_200ema": price_above_200ema,
+        "vwap_ratio":        vwap_ratio,
+        "macd_above_signal": macd_above_signal,
+    }, index=df.index)
+
+    # Label: 1 if forward 20-bar close return > 3 %
+    fwd_return = close.shift(-20) / close - 1
+    feat["is_profitable"] = (fwd_return > 0.03).astype(int)
+
+    # Drop the last 20 rows (no forward return yet) and any NaN rows
+    feat = feat.iloc[:-20].dropna()
+    return feat
+
+
+async def _train_ml_models(
+    symbols: list[str],
+    lookback_days: int = 750,
+    forward_days: int = 20,
+    target_return_pct: float = 3.0,
+) -> dict[str, Any]:
+    """Fetch OHLCV for each symbol, engineer features, train 4 classifiers with
+    TimeSeriesSplit CV, and return a payload matching the frontend ml state shape."""
+    try:
+        import time as _time
+        from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+        from sklearn.metrics import (
+            accuracy_score, f1_score, precision_score, recall_score, roc_auc_score,
+        )
+        from sklearn.model_selection import TimeSeriesSplit
+        import xgboost as xgb
+        import lightgbm as lgb
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"ML packages not installed. Run: pip install scikit-learn xgboost lightgbm joblib. Error: {exc}",
+        )
+
+    # Fetch OHLCV for all symbols in parallel (reuse fetch_ohlcv which already
+    # handles retries/fallbacks). Limit concurrency to 5.
+    sem = asyncio.Semaphore(5)
+
+    async def _fetch(sym: str) -> Optional[pd.DataFrame]:
+        async with sem:
+            async with httpx.AsyncClient(timeout=30) as client:
+                return await fetch_ohlcv(client, sym)
+
+    tasks = [_fetch(s) for s in symbols]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    frames: list[pd.DataFrame] = []
+    for sym, res in zip(symbols, results):
+        if isinstance(res, pd.DataFrame) and len(res) >= 250:
+            try:
+                feat = _build_ml_features(res.tail(lookback_days + forward_days))
+                if len(feat) >= 50:
+                    frames.append(feat)
+            except Exception as e:
+                logger.warning("ML feature build failed for %s: %s", sym, e)
+
+    if not frames:
+        raise HTTPException(status_code=422, detail="Not enough data to train ML models.")
+
+    combined = pd.concat(frames, ignore_index=True)
+    combined = combined.sample(frac=1, random_state=42).reset_index(drop=True)  # shuffle
+
+    feature_cols = [c for c in combined.columns if c != "is_profitable"]
+    X = combined[feature_cols].values
+    y = combined["is_profitable"].values
+
+    tscv = TimeSeriesSplit(n_splits=5)
+
+    classifiers = {
+        "XGBoost":            xgb.XGBClassifier(n_estimators=200, max_depth=4, learning_rate=0.05, use_label_encoder=False, eval_metric="logloss", random_state=42, n_jobs=-1),
+        "LightGBM":           lgb.LGBMClassifier(n_estimators=200, max_depth=4, learning_rate=0.05, random_state=42, n_jobs=-1, verbose=-1),
+        "RandomForest":       RandomForestClassifier(n_estimators=200, max_depth=8, random_state=42, n_jobs=-1),
+        "GradientBoosting":   GradientBoostingClassifier(n_estimators=100, max_depth=4, learning_rate=0.05, random_state=42),
+    }
+
+    model_results: list[dict[str, Any]] = []
+    best_importance: dict[str, float] = {}
+
+    for name, clf in classifiers.items():
+        fold_metrics: list[dict] = []
+        fold_importances: list[np.ndarray] = []
+        t0 = _time.perf_counter()
+
+        for train_idx, val_idx in tscv.split(X):
+            X_tr, X_val = X[train_idx], X[val_idx]
+            y_tr, y_val = y[train_idx], y[val_idx]
+            if len(np.unique(y_tr)) < 2:
+                continue
+            clf.fit(X_tr, y_tr)
+            y_pred = clf.predict(X_val)
+            try:
+                y_prob = clf.predict_proba(X_val)[:, 1]
+                auc = roc_auc_score(y_val, y_prob)
+            except Exception:
+                auc = 0.5
+            fold_metrics.append({
+                "acc":  accuracy_score(y_val, y_pred),
+                "prec": precision_score(y_val, y_pred, zero_division=0),
+                "rec":  recall_score(y_val, y_pred, zero_division=0),
+                "f1":   f1_score(y_val, y_pred, zero_division=0),
+                "auc":  auc,
+            })
+            if hasattr(clf, "feature_importances_"):
+                fold_importances.append(clf.feature_importances_)
+
+        elapsed = round(_time.perf_counter() - t0, 2)
+        if not fold_metrics:
+            continue
+
+        avg = {k: float(np.mean([fm[k] for fm in fold_metrics])) for k in fold_metrics[0]}
+        model_results.append({
+            "name":         name,
+            "acc":          round(avg["acc"],  4),
+            "prec":         round(avg["prec"], 4),
+            "rec":          round(avg["rec"],  4),
+            "f1":           round(avg["f1"],   4),
+            "auc":          round(avg["auc"],  4),
+            "train_time_s": elapsed,
+            "best":         False,
+        })
+        if fold_importances:
+            mean_imp = np.mean(fold_importances, axis=0)
+            if name not in best_importance or avg["auc"] > max(
+                mr["auc"] for mr in model_results[:-1] if mr["name"] == name
+            ):
+                best_importance = dict(zip(feature_cols, mean_imp.tolist()))
+
+    if not model_results:
+        raise HTTPException(status_code=422, detail="All models failed to train.")
+
+    # Mark best (highest AUC)
+    best_idx = max(range(len(model_results)), key=lambda i: model_results[i]["auc"])
+    model_results[best_idx]["best"] = True
+    best_model_name = model_results[best_idx]["name"]
+    best_auc = model_results[best_idx]["auc"]
+
+    # Feature importance from best model
+    total_imp = sum(best_importance.values()) or 1
+    direction_map = {
+        "rsi_14":             "bullish",
+        "macd_hist":          "bullish",
+        "ema_20_50_ratio":    "bullish",
+        "ema_50_200_ratio":   "bullish",
+        "volume_ratio":       "bullish",
+        "atr_pct":            "neutral",
+        "pattern_strength":   "bullish",
+        "bos_flag":           "bullish",
+        "price_above_200ema": "bullish",
+        "vwap_ratio":         "bullish",
+        "macd_above_signal":  "bullish",
+    }
+    features = [
+        {
+            "name":       col,
+            "importance": round((imp / total_imp) * 100, 2),
+            "direction":  direction_map.get(col, "neutral"),
+        }
+        for col, imp in sorted(best_importance.items(), key=lambda kv: kv[1], reverse=True)
+    ]
+
+    trained_at = datetime.now(timezone.utc).isoformat()
+    period_label = f"Last {len(combined)} rows · {len(symbols)} symbols"
+    payload = {
+        "models":           model_results,
+        "features":         features,
+        "dataset_size":     len(combined),
+        "training_period":  period_label,
+        "cv_folds":         5,
+        "best_threshold":   0.5,
+        "analysis_note":    (
+            f"Trained on {len(combined)} samples from {len(symbols)} NSE symbols. "
+            f"Best model: {best_model_name} (AUC {best_auc:.3f}). "
+            f"Label: 20-bar forward return > {target_return_pct}%."
+        ),
+        "trained_at":       trained_at,
+    }
+
+    # Persist to DB
+    with _db_lock, _db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO ml_training_runs
+              (trained_at, symbols_used, dataset_size, training_period, best_model, best_auc, payload)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (trained_at, len(symbols), len(combined), period_label, best_model_name, best_auc, json.dumps(payload)),
+        )
+
+    return payload
+
+
+class MLTrainRequest(BaseModel):
+    symbols: Optional[list[str]] = None
+    lookback_days: int = Field(default=750, ge=100, le=2000)
+    forward_days: int = Field(default=20, ge=5, le=60)
+    target_return_pct: float = Field(default=3.0, ge=0.5, le=20.0)
+
+
+@app.post("/train-ml")
+async def train_ml(body: MLTrainRequest) -> dict[str, Any]:
+    """Train XGBoost, LightGBM, RandomForest and GradientBoosting on real NSE OHLCV data.
+
+    Returns a payload matching the frontend ``ml`` state shape:
+    ``{ models, features, dataset_size, training_period, cv_folds, best_threshold, analysis_note, trained_at }``
+    """
+    symbols = body.symbols or _ML_DEFAULT_SYMBOLS
+    # Normalise: strip .NS suffix if present, take up to 20
+    symbols = [s.upper().replace(".NS", "").replace(".BSE", "").strip() for s in symbols[:20]]
+    return await _train_ml_models(
+        symbols,
+        lookback_days=body.lookback_days,
+        forward_days=body.forward_days,
+        target_return_pct=body.target_return_pct,
+    )
+
+
+@app.get("/train-ml/latest")
+async def train_ml_latest() -> dict[str, Any]:
+    """Return the most recent training run payload, or 404 if none exists."""
+    with _db_connect() as conn:
+        row = conn.execute(
+            "SELECT payload FROM ml_training_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="No training run found.")
+    return json.loads(row["payload"])
+
+
+@app.get("/train-ml/history")
+async def train_ml_history() -> dict[str, Any]:
+    """Return the last 10 training run summaries (no full payload)."""
+    with _db_connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, trained_at, symbols_used, dataset_size, training_period, best_model, best_auc
+            FROM ml_training_runs ORDER BY id DESC LIMIT 10
+            """
+        ).fetchall()
+    return {"runs": [dict(r) for r in rows]}
+
+
+# ---------------------------------------------------------------------------
+# WebSocket — live price feed (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+@app.websocket("/ws/live-prices")
+async def ws_live_prices(websocket: WebSocket) -> None:
+    """WebSocket endpoint for live NSE price streaming.
+
+    Protocol
+    --------
+    Client → Server (JSON):
+      ``{"action": "subscribe",   "symbols": ["RELIANCE", "TCS"]}``
+      ``{"action": "unsubscribe", "symbols": ["RELIANCE"]}``
+
+    Server → Client (JSON):
+      ``{"type": "price_update", "symbol": "RELIANCE", "price": 2850.5,
+         "change_pct": 0.45, "volume": 1234567, "ts": "..."}``
+      ``{"type": "error", "message": "..."}``
+    """
+    await websocket.accept()
+    try:
+        while True:
+            msg = await websocket.receive_json()
+            action = msg.get("action", "")
+            symbols = [s.upper().strip() for s in (msg.get("symbols") or []) if s]
+            if action == "subscribe" and symbols:
+                await _price_stream.connect(websocket, symbols)
+                await websocket.send_json({"type": "subscribed", "symbols": symbols})
+            elif action == "unsubscribe" and symbols:
+                await _price_stream.unsubscribe(websocket, symbols)
+                await websocket.send_json({"type": "unsubscribed", "symbols": symbols})
+            else:
+                await websocket.send_json({"type": "error", "message": f"Unknown action: {action!r}"})
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        logger.debug("WebSocket client error: %s", exc)
+    finally:
+        await _price_stream.disconnect(websocket)
+
+
+# ---------------------------------------------------------------------------
+# Angel One SmartAPI broker integration
+# ---------------------------------------------------------------------------
+
+# SmartAPI optional imports (graceful degradation when not installed).
+try:
+    from SmartApi import SmartConnect as _SmartConnect  # type: ignore
+    import pyotp as _pyotp  # type: ignore
+    _SMARTAPI_OK = True
+except ImportError:
+    _SmartConnect = None  # type: ignore
+    _pyotp = None  # type: ignore
+    _SMARTAPI_OK = False
+    logger.warning("smartapi-python / pyotp not installed. Broker features disabled.")
+
+# --------------- In-memory session state ---------------
+_broker_lock = asyncio.Lock()
+_broker_session: dict = {
+    "connected": False,
+    "client_id": None,
+    "auth_token": None,
+    "feed_token": None,
+    "refresh_token": None,
+    "last_connected_at": None,
+    "obj": None,          # SmartConnect instance (or None)
+}
+
+
+def _broker_keys_configured() -> bool:
+    return bool(ANGEL_CLIENT_ID and ANGEL_PASSWORD and ANGEL_TOTP_SECRET and ANGEL_API_KEY)
+
+
+async def _get_smart_obj():
+    """Return the current authenticated SmartConnect object, or raise 503."""
+    async with _broker_lock:
+        if not _broker_session["connected"] or _broker_session["obj"] is None:
+            raise HTTPException(status_code=503, detail="Broker not connected. Call POST /broker/connect first.")
+        return _broker_session["obj"]
+
+
+# --------------- Endpoints ---------------
+
+@app.get("/broker/status")
+async def broker_status():
+    """Return connection status and key-configuration flag."""
+    async with _broker_lock:
+        return {
+            "connected": _broker_session["connected"],
+            "client_id": _broker_session["client_id"],
+            "last_connected_at": _broker_session["last_connected_at"],
+            "keys_configured": _broker_keys_configured(),
+            "smartapi_installed": _SMARTAPI_OK,
+        }
+
+
+@app.post("/broker/connect")
+async def broker_connect():
+    """Authenticate with Angel One via TOTP and persist the session."""
+    if not _SMARTAPI_OK:
+        raise HTTPException(status_code=501, detail="smartapi-python not installed. Run: pip install smartapi-python pyotp")
+    if not _broker_keys_configured():
+        raise HTTPException(status_code=400, detail="Angel One credentials not configured. Add them to the vault.")
+    try:
+        obj = _SmartConnect(api_key=ANGEL_API_KEY)
+        totp_val = _pyotp.TOTP(ANGEL_TOTP_SECRET).now()
+        data = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: obj.generateSession(ANGEL_CLIENT_ID, ANGEL_PASSWORD, totp_val),
+        )
+        if not data or data.get("status") is False:
+            msg = data.get("message", "Authentication failed") if data else "No response from Angel One"
+            raise HTTPException(status_code=401, detail=msg)
+        session_data = data.get("data", {})
+        auth_token = session_data.get("jwtToken", "")
+        refresh_token = session_data.get("refreshToken", "")
+        feed_token = await asyncio.get_event_loop().run_in_executor(None, obj.getfeedToken)
+        async with _broker_lock:
+            _broker_session.update({
+                "connected": True,
+                "client_id": ANGEL_CLIENT_ID,
+                "auth_token": auth_token,
+                "feed_token": feed_token,
+                "refresh_token": refresh_token,
+                "last_connected_at": _now_iso(),
+                "obj": obj,
+            })
+        logger.info("Broker connected for client %s", ANGEL_CLIENT_ID)
+        return {"ok": True, "message": f"Connected as {ANGEL_CLIENT_ID}"}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Broker connect failed: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/broker/disconnect")
+async def broker_disconnect():
+    """Terminate the Angel One session."""
+    async with _broker_lock:
+        obj = _broker_session.get("obj")
+        if obj is not None:
+            try:
+                await asyncio.get_event_loop().run_in_executor(None, obj.terminateSession, ANGEL_CLIENT_ID)
+            except Exception:
+                pass  # log but don't fail
+        _broker_session.update({
+            "connected": False,
+            "client_id": None,
+            "auth_token": None,
+            "feed_token": None,
+            "refresh_token": None,
+            "obj": None,
+        })
+    logger.info("Broker disconnected.")
+    return {"ok": True}
+
+
+@app.get("/broker/funds")
+async def broker_funds():
+    obj = await _get_smart_obj()
+    try:
+        data = await asyncio.get_event_loop().run_in_executor(None, obj.rmsLimit)
+        if not data or data.get("status") is False:
+            raise HTTPException(status_code=502, detail=data.get("message", "Failed to fetch funds"))
+        d = data.get("data", {})
+        net = float(d.get("net", 0) or 0)
+        available = float(d.get("availablecash", 0) or 0)
+        used = float(d.get("utiliseddebits", d.get("utilisedmargin", 0)) or 0)
+        return {"net": net, "available_cash": available, "used_margin": used, "raw": d}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/broker/positions")
+async def broker_positions():
+    obj = await _get_smart_obj()
+    try:
+        data = await asyncio.get_event_loop().run_in_executor(None, obj.position)
+        if not data or data.get("status") is False:
+            raise HTTPException(status_code=502, detail=data.get("message", "Failed to fetch positions"))
+        raw = data.get("data") or []
+        positions = []
+        for p in raw:
+            qty = int(p.get("netqty", 0) or 0)
+            if qty == 0:
+                continue
+            avg = float(p.get("netavgprice", p.get("avgnetprice", 0)) or 0)
+            ltp = float(p.get("ltp", 0) or 0)
+            pnl = float(p.get("unrealised", p.get("pnl", 0)) or 0)
+            pnl_pct = round((pnl / (avg * abs(qty)) * 100), 2) if avg and qty else 0
+            positions.append({
+                "symbol": p.get("tradingsymbol", ""),
+                "qty": qty,
+                "avgprice": avg,
+                "ltp": ltp,
+                "pnl": pnl,
+                "pnlpercent": pnl_pct,
+                "exchange": p.get("exchange", "NSE"),
+                "producttype": p.get("producttype", ""),
+            })
+        return {"positions": positions}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/broker/holdings")
+async def broker_holdings():
+    obj = await _get_smart_obj()
+    try:
+        data = await asyncio.get_event_loop().run_in_executor(None, obj.holding)
+        if not data or data.get("status") is False:
+            raise HTTPException(status_code=502, detail=data.get("message", "Failed to fetch holdings"))
+        raw = data.get("data") or []
+        holdings = []
+        for h in raw:
+            qty = int(h.get("quantity", 0) or 0)
+            avg = float(h.get("averageprice", 0) or 0)
+            ltp = float(h.get("ltp", 0) or 0)
+            pnl = float(h.get("profitandloss", 0) or 0)
+            val = qty * ltp
+            holdings.append({
+                "tradingsymbol": h.get("tradingsymbol", ""),
+                "quantity": qty,
+                "averageprice": avg,
+                "ltp": ltp,
+                "holdingvalue": val,
+                "profitandloss": pnl,
+                "exchange": h.get("exchange", "NSE"),
+                "isin": h.get("isin", ""),
+            })
+        return {"holdings": holdings}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/broker/orders")
+async def broker_orders_list():
+    obj = await _get_smart_obj()
+    try:
+        data = await asyncio.get_event_loop().run_in_executor(None, obj.orderBook)
+        if not data or data.get("status") is False:
+            # empty order book is not an error
+            if data and "No Record" in data.get("message", ""):
+                return {"orders": []}
+            raise HTTPException(status_code=502, detail=data.get("message", "Failed to fetch orders") if data else "No response")
+        raw = data.get("data") or []
+        orders = []
+        for o in raw:
+            orders.append({
+                "order_id": o.get("orderid", ""),
+                "symbol": o.get("tradingsymbol", ""),
+                "side": o.get("transactiontype", ""),
+                "qty": int(o.get("quantity", 0) or 0),
+                "price": float(o.get("price", 0) or 0),
+                "order_type": o.get("ordertype", ""),
+                "status": o.get("status", ""),
+                "placed_at": o.get("updatetime", o.get("exchtime", "")),
+                "exchange": o.get("exchange", "NSE"),
+            })
+        return {"orders": orders}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+class BrokerOrderRequest(BaseModel):
+    symbol: str
+    side: str                     # BUY | SELL
+    qty: int
+    order_type: str = "MARKET"    # MARKET | LIMIT | SL
+    price: float = 0.0
+    exchange: str = "NSE"
+    product_type: str = "INTRADAY"  # INTRADAY | DELIVERY | CARRYFORWARD
+
+
+@app.post("/broker/order")
+async def broker_place_order(req: BrokerOrderRequest):
+    obj = await _get_smart_obj()
+    try:
+        params = {
+            "variety": "NORMAL",
+            "tradingsymbol": req.symbol.upper(),
+            "symboltoken": "",          # Angel One resolves by symbol name
+            "transactiontype": req.side.upper(),
+            "exchange": req.exchange.upper(),
+            "ordertype": req.order_type.upper(),
+            "producttype": req.product_type.upper(),
+            "duration": "DAY",
+            "price": str(req.price) if req.order_type.upper() != "MARKET" else "0",
+            "triggerprice": "0",
+            "squareoff": "0",
+            "stoploss": "0",
+            "quantity": str(req.qty),
+        }
+        result = await asyncio.get_event_loop().run_in_executor(None, lambda: obj.placeOrder(params))
+        if not result or result.get("status") is False:
+            msg = result.get("message", "Order rejected") if result else "No response"
+            raise HTTPException(status_code=400, detail=msg)
+        order_id = result.get("data", {}).get("orderid", "") if isinstance(result.get("data"), dict) else result.get("data", "")
+        # Persist to local DB
+        with _db() as conn:
+            conn.execute(
+                """INSERT INTO broker_orders
+                   (order_id, symbol, exchange, side, qty, price, order_type, status, placed_at, response)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (str(order_id), req.symbol.upper(), req.exchange.upper(), req.side.upper(),
+                 req.qty, req.price, req.order_type.upper(), "PENDING", _now_iso(), json.dumps(result)),
+            )
+        logger.info("Broker order placed: %s %s %s x%d → order_id=%s", req.side, req.symbol, req.order_type, req.qty, order_id)
+        return {"ok": True, "order_id": order_id, "message": result.get("message", "Order placed")}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Broker place order failed: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/broker/sync-paper/{trade_id}")
+async def broker_sync_paper(trade_id: int):
+    """Replicate a paper trade as a real Angel One order."""
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT symbol, side, qty, entry_price, status FROM paper_trades WHERE id=?",
+            (trade_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Paper trade not found")
+    if row["status"] != "open":
+        raise HTTPException(status_code=400, detail="Only open paper trades can be synced")
+    req = BrokerOrderRequest(
+        symbol=row["symbol"],
+        side=row["side"].upper(),
+        qty=row["qty"],
+        order_type="MARKET",
+        price=0.0,
+    )
+    result = await broker_place_order(req)
+    # Link the broker order to the paper trade
+    with _db() as conn:
+        conn.execute(
+            "UPDATE broker_orders SET paper_trade_id=? WHERE order_id=?",
+            (trade_id, result.get("order_id", "")),
+        )
+    return {**result, "paper_trade_id": trade_id}
 
 
 # ---------------------------------------------------------------------------
