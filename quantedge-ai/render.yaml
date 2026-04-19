@@ -1,0 +1,38 @@
+services:
+  - type: web
+    name: quantedge-backend
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    plan: free
+    region: singapore   # closest free-tier region to India
+
+    # Render injects PORT automatically. All other vars below.
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: LOG_LEVEL
+        value: INFO
+      - key: SESSION_TTL_HOURS
+        value: "24"
+      - key: PAPER_CAPITAL
+        value: "1000000"
+      - key: PAPER_RISK_PCT
+        value: "2.0"
+      - key: PAPER_MAX_OPEN
+        value: "5"
+      - key: PAPER_MAX_HOLD_DAYS
+        value: "20"
+      - key: PAPER_MONITOR_INTERVAL
+        value: "60"
+      - key: AUTO_PAPER_TRADE_ENABLED
+        value: "true"
+      - key: AUTO_PAPER_TRADE_THRESHOLD
+        value: "70"
+      - key: AUTO_TRADE_MARKET_OPEN_ONLY
+        value: "false"
+      - key: TELEGRAM_CHAT_ID
+        value: "1681623488"
+      # SECRET — set this in the Render dashboard, NOT here:
+      # PYTHONPATH is not needed; uvicorn runs from rootDir.
