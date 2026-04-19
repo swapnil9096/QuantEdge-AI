@@ -214,7 +214,9 @@ except ImportError:
     _VAULT_DEPS_OK = False
     logger.warning("Vault dependencies missing. Install cryptography + PyJWT to use secrets lock.")
 
-SECRETS_VAULT_PATH = Path(__file__).resolve().parent / "secrets.enc.json"
+_data_dir = Path(os.getenv("DATA_DIR", str(Path(__file__).resolve().parent / "data")))
+_data_dir.mkdir(parents=True, exist_ok=True)
+SECRETS_VAULT_PATH = _data_dir / "secrets.enc.json"
 SECRETS_VAULT_AAD = b"quantedge-secrets-v1"
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_HOURS", "24")) * 3600
 
@@ -2521,8 +2523,7 @@ async def deep_analyze(symbol: str, exchange: str = "NSE") -> dict[str, Any]:
 # ===========================================================================
 
 
-DB_PATH = Path(__file__).resolve().parent / "data" / "quantedge.db"
-DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+DB_PATH = _data_dir / "quantedge.db"
 
 _db_lock = threading.Lock()  # single SQLite writer; reads are safe concurrently
 
