@@ -99,6 +99,10 @@ ANGEL_PASSWORD = os.getenv("ANGEL_PASSWORD", "")
 ANGEL_TOTP_SECRET = os.getenv("ANGEL_TOTP_SECRET", "")
 ANGEL_API_KEY = os.getenv("ANGEL_API_KEY", "")
 
+# Set BROKER_ENABLED=true in your environment / Render dashboard to enable
+# real-money Angel One trading.  Defaults to disabled for safety.
+BROKER_ENABLED: bool = os.getenv("BROKER_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+
 
 # ---------------------------------------------------------------------------
 # Secrets vault (encrypted at rest, password-unlocked at runtime)
@@ -5332,12 +5336,27 @@ async def _get_smart_obj():
 
 # --------------- Endpoints ---------------
 
+def _assert_broker_enabled() -> None:
+    if not BROKER_ENABLED:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "broker_disabled",
+                "message": (
+                    "Real-money broker integration is currently disabled. "
+                    "Set BROKER_ENABLED=true in your environment to enable it."
+                ),
+            },
+        )
+
+
 @app.get("/broker/status")
 async def broker_status():
     """Return connection status and key-configuration flag."""
     async with _broker_lock:
         return {
-            "connected": _broker_session["connected"],
+            "enabled": BROKER_ENABLED,
+            "connected": _broker_session["connected"] if BROKER_ENABLED else False,
             "client_id": _broker_session["client_id"],
             "last_connected_at": _broker_session["last_connected_at"],
             "keys_configured": _broker_keys_configured(),
@@ -5348,6 +5367,7 @@ async def broker_status():
 @app.post("/broker/connect")
 async def broker_connect():
     """Authenticate with Angel One via TOTP and persist the session."""
+    _assert_broker_enabled()
     if not _SMARTAPI_OK:
         raise HTTPException(status_code=501, detail="smartapi-python not installed. Run: pip install smartapi-python pyotp")
     if not _broker_keys_configured():
@@ -5419,6 +5439,7 @@ async def broker_disconnect():
 
 @app.get("/broker/funds")
 async def broker_funds():
+    _assert_broker_enabled()
     obj = await _get_smart_obj()
     try:
         data = await asyncio.get_event_loop().run_in_executor(None, obj.rmsLimit)
@@ -5437,6 +5458,7 @@ async def broker_funds():
 
 @app.get("/broker/positions")
 async def broker_positions():
+    _assert_broker_enabled()
     obj = await _get_smart_obj()
     try:
         data = await asyncio.get_event_loop().run_in_executor(None, obj.position)
@@ -5471,6 +5493,7 @@ async def broker_positions():
 
 @app.get("/broker/holdings")
 async def broker_holdings():
+    _assert_broker_enabled()
     obj = await _get_smart_obj()
     try:
         data = await asyncio.get_event_loop().run_in_executor(None, obj.holding)
@@ -5503,6 +5526,7 @@ async def broker_holdings():
 
 @app.get("/broker/orders")
 async def broker_orders_list():
+    _assert_broker_enabled()
     obj = await _get_smart_obj()
     try:
         data = await asyncio.get_event_loop().run_in_executor(None, obj.orderBook)
@@ -5544,6 +5568,7 @@ class BrokerOrderRequest(BaseModel):
 
 @app.post("/broker/order")
 async def broker_place_order(req: BrokerOrderRequest):
+    _assert_broker_enabled()
     obj = await _get_smart_obj()
     try:
         params = {
@@ -5587,6 +5612,7 @@ async def broker_place_order(req: BrokerOrderRequest):
 @app.post("/broker/sync-paper/{trade_id}")
 async def broker_sync_paper(trade_id: int):
     """Replicate a paper trade as a real Angel One order."""
+    _assert_broker_enabled()
     with _db() as conn:
         row = conn.execute(
             "SELECT symbol, side, qty, entry_price, status FROM paper_trades WHERE id=?",

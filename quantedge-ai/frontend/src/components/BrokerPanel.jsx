@@ -86,6 +86,7 @@ export function BrokerPanel() {
     }
   };
 
+  const brokerEnabled = status?.enabled !== false;
   const connected = !!status?.connected;
   const keysConfigured = status?.keys_configured !== false;
 
@@ -144,7 +145,7 @@ export function BrokerPanel() {
             ) : (
               <button
                 onClick={handleConnect}
-                disabled={connecting || !keysConfigured}
+                disabled={connecting || !keysConfigured || !brokerEnabled}
                 style={{
                   padding: '5px 12px',
                   background: connecting || !keysConfigured ? C.border : `linear-gradient(135deg, ${C.teal} 0%, ${C.blue} 100%)`,
@@ -185,7 +186,28 @@ export function BrokerPanel() {
           </div>
         )}
 
-        {!keysConfigured && (
+        {!brokerEnabled && (
+          <div
+            style={{
+              padding: '0.7rem 0.85rem',
+              background: 'rgba(107,114,128,0.12)',
+              border: `1px solid ${C.muted}`,
+              borderRadius: 10,
+              color: C.muted,
+              fontSize: 12,
+              lineHeight: 1.6,
+              marginBottom: 12,
+            }}
+          >
+            <b>Real-money broker integration is disabled.</b>
+            {' '}Paper trading continues to work normally.
+            To enable real Angel One trading, set{' '}
+            <code style={{ fontFamily: FONT_MONO }}>BROKER_ENABLED=true</code>
+            {' '}in your Render environment and redeploy.
+          </div>
+        )}
+
+        {!keysConfigured && brokerEnabled && (
           <div
             style={{
               padding: '0.7rem 0.85rem',
