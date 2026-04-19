@@ -1303,12 +1303,23 @@ def _fetch_yahoo_fundamentals_sync(yahoo_symbol: str) -> dict[str, Any]:
     except Exception as exc:
         logger.debug("yfinance info failed for %s: %s", yahoo_symbol, exc)
 
-    rev_growth = _to_float(info.get("revenueGrowth"))
-    profit_growth = _to_float(info.get("earningsGrowth"))
-    debt_to_equity = _to_float(info.get("debtToEquity"))
-    roe = _to_float(info.get("returnOnEquity"))
-    insider_pct = _to_float(info.get("heldPercentInsiders"))
-    inst_pct = _to_float(info.get("heldPercentInstitutions"))
+    # yfinance field names vary by version — try multiple aliases.
+    def _pick(*keys: str) -> Optional[float]:
+        for k in keys:
+            v = _to_float(info.get(k))
+            if v is not None:
+                return v
+        return None
+
+    rev_growth   = _pick("revenueGrowth", "earningsQuarterlyGrowth", "revenueQuarterlyGrowth")
+    profit_growth = _pick("earningsGrowth", "netIncomeGrowth", "earningsQuarterlyGrowth")
+    debt_to_equity = _pick("debtToEquity", "totalDebt")
+    roe          = _pick("returnOnEquity", "returnOnAssets")
+    pe_ratio     = _pick("trailingPE", "forwardPE", "priceToEarningsTrailing")
+    book_value   = _pick("bookValue", "priceToBook")
+    market_cap   = _pick("marketCap", "enterpriseValue")
+    insider_pct  = _pick("heldPercentInsiders", "insidersPercentHeld")
+    inst_pct     = _pick("heldPercentInstitutions", "institutionsPercentHeld")
 
     # yfinance returns *fractions* for growth/ROE (0.18 = 18%); normalise to percent.
     if rev_growth is not None and -2 <= rev_growth <= 2:
@@ -1325,32 +1336,79 @@ def _fetch_yahoo_fundamentals_sync(yahoo_symbol: str) -> dict[str, Any]:
     if debt_to_equity is not None and debt_to_equity > 10:
         debt_to_equity = debt_to_equity / 100
 
-    # Fallback ROE via financials if missing from info.
-    if roe is None:
-        try:
-            fin = ticker.financials
-            bs = ticker.balance_sheet
-            if fin is not None and bs is not None and not fin.empty and not bs.empty:
+    # Fallback: derive missing metrics from raw financials statements.
+    try:
+        fin = ticker.financials
+        bs  = ticker.balance_sheet
+
+        if fin is not None and bs is not None and not fin.empty and not bs.empty:
+            # ROE from financials if info didn't carry it.
+            if roe is None:
                 ni = _to_float(fin.loc["Net Income"].iloc[0]) if "Net Income" in fin.index else None
-                eq_row = None
-                for key in ("Stockholders Equity", "Total Stockholder Equity", "Total Equity Gross Minority Interest"):
-                    if key in bs.index:
-                        eq_row = key
-                        break
+                eq_row = next(
+                    (k for k in ("Stockholders Equity", "Total Stockholder Equity",
+                                 "Total Equity Gross Minority Interest") if k in bs.index),
+                    None,
+                )
                 equity = _to_float(bs.loc[eq_row].iloc[0]) if eq_row else None
                 if ni is not None and equity and equity > 0:
                     roe = ni / equity * 100
-        except Exception as exc:
-            logger.debug("ROE fallback failed for %s: %s", yahoo_symbol, exc)
+
+            # Revenue growth from two consecutive years if info missed it.
+            if rev_growth is None and "Total Revenue" in fin.index and fin.shape[1] >= 2:
+                r_new = _to_float(fin.loc["Total Revenue"].iloc[0])
+                r_old = _to_float(fin.loc["Total Revenue"].iloc[1])
+                if r_new is not None and r_old and r_old > 0:
+                    rev_growth = (r_new - r_old) / r_old * 100
+
+            # Profit growth from two consecutive years.
+            if profit_growth is None and "Net Income" in fin.index and fin.shape[1] >= 2:
+                n_new = _to_float(fin.loc["Net Income"].iloc[0])
+                n_old = _to_float(fin.loc["Net Income"].iloc[1])
+                if n_new is not None and n_old and n_old > 0:
+                    profit_growth = (n_new - n_old) / n_old * 100
+
+            # D/E from balance sheet.
+            if debt_to_equity is None:
+                debt_row = next(
+                    (k for k in ("Total Debt", "Long Term Debt", "Short Long Term Debt") if k in bs.index),
+                    None,
+                )
+                eq_row2 = next(
+                    (k for k in ("Stockholders Equity", "Total Stockholder Equity",
+                                 "Total Equity Gross Minority Interest") if k in bs.index),
+                    None,
+                )
+                debt_val = _to_float(bs.loc[debt_row].iloc[0]) if debt_row else None
+                eq_val   = _to_float(bs.loc[eq_row2].iloc[0]) if eq_row2 else None
+                if debt_val is not None and eq_val and eq_val > 0:
+                    debt_to_equity = debt_val / eq_val
+
+            # Market cap from price × shares if missing.
+            if market_cap is None:
+                shares = _to_float(info.get("sharesOutstanding") or info.get("impliedSharesOutstanding"))
+                price  = _to_float(info.get("currentPrice") or info.get("regularMarketPrice"))
+                if shares and price:
+                    market_cap = shares * price
+
+            # P/E from price / EPS if missing.
+            if pe_ratio is None:
+                eps = _to_float(info.get("trailingEps") or info.get("epsTrailingTwelveMonths"))
+                price = _to_float(info.get("currentPrice") or info.get("regularMarketPrice"))
+                if eps and eps > 0 and price:
+                    pe_ratio = price / eps
+
+    except Exception as exc:
+        logger.debug("Fundamentals financials fallback failed for %s: %s", yahoo_symbol, exc)
 
     return {
-        "pe_ratio": _to_float(info.get("trailingPE")),
+        "pe_ratio": pe_ratio,
         "debt_to_equity": debt_to_equity,
         "roe": roe,
         "revenue_growth": rev_growth,
         "profit_growth": profit_growth,
-        "book_value": _to_float(info.get("bookValue")),
-        "market_cap": _to_float(info.get("marketCap")),
+        "book_value": book_value,
+        "market_cap": market_cap,
         "sector": info.get("sector") or "",
         "industry": info.get("industry") or "",
         "currency": info.get("currency") or "INR",
@@ -2387,6 +2445,7 @@ def get_market_status(now: Optional[datetime] = None) -> dict[str, Any]:
 
     if weekday >= 5:
         status = "WEEKEND"
+        holiday_name = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"][weekday]
     elif not is_session_today:
         status = "HOLIDAY"
         holiday_name = _holiday_name_for(today_iso) or "NSE holiday"
@@ -2411,9 +2470,17 @@ def get_market_status(now: Optional[datetime] = None) -> dict[str, Any]:
 
     # Days-until-open stated as distinct IST calendar days for the UI.
     next_open_date_iso = next_open.date().isoformat()
-    next_open_reason = _holiday_name_for(
-        (next_open.date() - timedelta(days=1)).isoformat()
-    )  # informational only
+    # Friendly hint: explain why market is closed right now.
+    if status == "WEEKEND":
+        next_open_reason = f"Weekend — next session on {next_open.strftime('%A, %d %b')}"
+    elif status == "HOLIDAY":
+        next_open_reason = f"{holiday_name} — next session on {next_open.strftime('%A, %d %b')}"
+    elif status == "POST_CLOSE":
+        next_open_reason = f"Market closed for today — next session on {next_open.strftime('%A, %d %b')}"
+    elif status in ("PRE_MARKET", "PRE_OPEN"):
+        next_open_reason = f"Pre-market — session opens at {MARKET_OPEN_HM[0]:02d}:{MARKET_OPEN_HM[1]:02d} IST"
+    else:
+        next_open_reason = None
 
     minutes_to_open = max(int((next_open - now_ist).total_seconds() // 60), 0)
 
