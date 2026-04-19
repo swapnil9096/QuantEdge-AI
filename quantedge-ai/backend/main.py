@@ -3177,9 +3177,11 @@ def _init_user_schema() -> None:
             )
             """
         )
-        # Add user_id column to paper_trades if missing (safe migration)
+        # Add user_id column to paper_trades if missing (safe migration).
+        # Guard with `existing_cols` so we skip on a fresh DB where the table
+        # doesn't exist yet — _init_paper_schema() creates it right after.
         existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(paper_trades)")}
-        if "user_id" not in existing_cols:
+        if existing_cols and "user_id" not in existing_cols:
             conn.execute("ALTER TABLE paper_trades ADD COLUMN user_id INTEGER REFERENCES users(id)")
         # Add user_id column to broker_orders if table exists
         broker_cols = {row[1] for row in conn.execute("PRAGMA table_info(broker_orders)")}
