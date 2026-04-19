@@ -15,9 +15,10 @@ import { BrokerPanel } from './components/BrokerPanel.jsx';
 import { AuthScreen } from './components/AuthScreen.jsx';
 import { useWebSocket } from './hooks/useWebSocket.js';
 import {
-  installFetchInterceptor,
+  installFetchInterceptor, apiAuthMe,
   fetchStockData, fetchBacktest, fetchMLTraining, fetchAIExplanation,
 } from './utils/api.js';
+import { Spinner } from './components/shared.jsx';
 import { parseSymbol, computeSetup } from './utils/indicators.js';
 
 // ---------------------------------------------------------------------------
@@ -68,18 +69,60 @@ export default function App() {
   const [backendDown, setBackendDown] = useState(false);
 
   // ---- Auth gate -----------------------------------------------------------
-  const [currentUser, setCurrentUser] = useState(() => {
-    try { return JSON.parse(localStorage.getItem('quantedge_user')); } catch { return null; }
-  });
+  // Do NOT initialise currentUser from localStorage directly.
+  // We validate the stored token with /auth/me before showing the app so the
+  // main UI (and its child components) never mounts with a stale/invalid token.
+  const [currentUser, setCurrentUser] = useState(null);
+
+  // sessionChecking=true only when there are stored credentials to verify.
+  // While true we render a loading spinner instead of the main UI, which means
+  // child components don't mount and don't fire API calls before the fetch
+  // interceptor is set up — eliminating the useEffect ordering race.
+  const [sessionChecking, setSessionChecking] = useState(
+    () => !!(localStorage.getItem(TOKEN_KEY) && localStorage.getItem('quantedge_user')),
+  );
 
   const handleLogout = useCallback(() => {
     localStorage.removeItem(TOKEN_KEY);
     localStorage.removeItem('quantedge_user');
     setCurrentUser(null);
+    setSessionChecking(false);
   }, []);
 
   useEffect(() => {
+    // Install the fetch interceptor first (synchronous).
     const teardown = installFetchInterceptor({ onLocked: handleLogout });
+
+    const token    = localStorage.getItem(TOKEN_KEY);
+    const userJson = localStorage.getItem('quantedge_user');
+    if (!token || !userJson) {
+      setSessionChecking(false);
+      return teardown;
+    }
+
+    let storedUser = null;
+    try { storedUser = JSON.parse(userJson); } catch { /* fall through */ }
+    if (!storedUser) {
+      localStorage.removeItem(TOKEN_KEY);
+      localStorage.removeItem('quantedge_user');
+      setSessionChecking(false);
+      return teardown;
+    }
+
+    // Validate the token against the live backend before showing the app.
+    // apiAuthMe() goes through the patched fetch so the interceptor adds the
+    // Authorization header automatically.
+    apiAuthMe()
+      .then(() => setCurrentUser(storedUser))
+      .catch(() => {
+        // 401 (invalid/expired token) or network error — clear the session.
+        // The interceptor may have already called handleLogout; these
+        // operations are idempotent so double-calling is harmless.
+        localStorage.removeItem(TOKEN_KEY);
+        localStorage.removeItem('quantedge_user');
+      })
+      .finally(() => setSessionChecking(false));
+
     return teardown;
   }, [handleLogout]);
 
@@ -220,6 +263,17 @@ export default function App() {
   }, []);
 
   // ---- Auth gate rendering -------------------------------------------------
+  // Show a minimal spinner while we verify the stored session.
+  if (sessionChecking) {
+    return (
+      <div style={{
+        minHeight: '100vh', background: C.bg,
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+      }}>
+        <Spinner size={28} color={C.teal} />
+      </div>
+    );
+  }
   if (!currentUser) {
     return <AuthScreen onLoggedIn={handleLoggedIn} />;
   }
