@@ -111,6 +111,11 @@ if not SECRET_KEY:
 
 USER_JWT_TTL_SECONDS = int(os.getenv("USER_JWT_TTL_HOURS", "720")) * 3600  # 30 days default
 
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 # bcrypt — optional at import time so server still starts without it
 try:
     import bcrypt as _bcrypt_mod
@@ -3164,10 +3169,6 @@ _init_broker_schema()
 
 
 # ---- Helpers -------------------------------------------------------------
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 def _row_to_trade_dict(row: sqlite3.Row) -> dict[str, Any]:
