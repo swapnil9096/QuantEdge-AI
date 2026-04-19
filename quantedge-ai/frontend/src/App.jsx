@@ -92,7 +92,12 @@ export default function App() {
         setLockStatus({ ...s, unlocked: s.unlocked && hasToken });
         setBackendDown(false);
       } catch {
-        if (!cancelled) setBackendDown(true);
+        if (!cancelled) {
+          setBackendDown(true);
+          // Resolve the spinner so the UI isn't stuck on load when the
+          // backend is unreachable (e.g. Render free-tier cold start).
+          setLockStatus({ unlocked: false, configured: false });
+        }
       }
     })();
     return () => { cancelled = true; };
