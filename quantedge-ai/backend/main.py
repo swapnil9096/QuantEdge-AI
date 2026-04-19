@@ -3278,7 +3278,7 @@ async def open_paper_trade(
     existing = await asyncio.to_thread(_fetch_open_trade_for_symbol_sync, symbol.upper())
     if existing:
         raise PaperTradeError(
-            f"An open position for {symbol.upper()} already exists (#${existing['id']})."
+            f"An open position for {symbol.upper()} already exists (#{existing['id']})."
         )
 
     open_count = await asyncio.to_thread(_count_open_positions_sync)
