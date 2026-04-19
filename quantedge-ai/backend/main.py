@@ -1715,21 +1715,106 @@ async def _fetch_nse_shareholding(symbol: str) -> dict[str, Optional[float]]:
     return result
 
 
+async def _fetch_screener_shareholding(symbol: str) -> dict[str, Optional[float]]:
+    """Scrape shareholding pattern from Screener.in.
+
+    Screener.in is the most reliable free source for Indian stock shareholding
+    data — it covers every NSE/BSE listed stock and works from server IPs.
+    Uses regex so no extra dependencies (no BeautifulSoup needed).
+    """
+    import re
+
+    result: dict[str, Optional[float]] = {
+        "promoter_holding": None,
+        "fii_holding": None,
+        "dii_holding": None,
+        "promoter_pledge": None,
+    }
+    sym = symbol.upper()
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    # Try consolidated first (most complete), then standalone
+    for url in (
+        f"https://www.screener.in/company/{sym}/consolidated/",
+        f"https://www.screener.in/company/{sym}/",
+    ):
+        try:
+            async with httpx.AsyncClient(
+                headers=headers, timeout=12, follow_redirects=True
+            ) as client:
+                r = await client.get(url)
+                if r.status_code != 200:
+                    continue
+                html = r.text
+
+                # Screener HTML: each row has a button with category name,
+                # followed by multiple <td>X%</td> quarterly values.
+                # We take the LAST value (most recent quarter).
+                def _extract_latest(category: str) -> Optional[float]:
+                    m = re.search(
+                        rf'{re.escape(category)}.*?</button>.*?</td>(.*?)</tr>',
+                        html, re.IGNORECASE | re.DOTALL,
+                    )
+                    if not m:
+                        return None
+                    vals = re.findall(r'<td>([\d.]+)%</td>', m.group(1))
+                    return _to_float(vals[-1]) if vals else None
+
+                promoter = _extract_latest("Promoters")
+                fii      = _extract_latest("FIIs")
+                dii      = _extract_latest("DIIs")
+
+                # Pledge: look for pledged percentage anywhere on the page
+                pledge_m = re.search(r'[Pp]ledged[^<\d]*([\d.]+)\s*%', html)
+                pledge = _to_float(pledge_m.group(1)) if pledge_m else None
+
+                if promoter is not None:
+                    logger.debug(
+                        "Screener.in shareholding OK for %s: promoter=%.2f%% fii=%s dii=%s pledge=%s",
+                        sym, promoter, fii, dii, pledge,
+                    )
+                    result.update(
+                        promoter_holding=promoter,
+                        fii_holding=fii,
+                        dii_holding=dii,
+                        promoter_pledge=pledge,
+                    )
+                    return result
+        except Exception as exc:
+            logger.debug("Screener.in fetch failed for %s (%s): %s", sym, url, exc)
+            continue
+
+    logger.debug("Screener.in: no shareholding data found for %s", sym)
+    return result
+
+
 async def fetch_fundamentals(symbol: str, exchange: str = "NSE") -> FundamentalsSnapshot:
     cached = _cache_get(_fundamentals_cache, symbol.upper(), _fundamentals_cache_ttl)
     if cached is not None:
         return cached
 
     yahoo_symbol = _normalize_yahoo_symbol(symbol, exchange)
+    is_nse = exchange.upper() == "NSE"
 
-    # Run all four sources in parallel: TwelveData, AlphaVantage, Yahoo, NSE shareholding
-    td_task    = _fetch_twelvedata_statistics(symbol)
-    av_task    = _fetch_alphavantage_overview(symbol)
-    yahoo_task = asyncio.to_thread(_fetch_yahoo_fundamentals_sync, yahoo_symbol)
-    nse_task   = _fetch_nse_shareholding(symbol) if exchange.upper() == "NSE" else asyncio.sleep(0, result={})
+    # Run all sources in parallel:
+    # Financials  : TwelveData → AlphaVantage → Yahoo (first non-None wins)
+    # Shareholding: NSE API → Screener.in → TwelveData proxy → Yahoo proxy
+    td_task       = _fetch_twelvedata_statistics(symbol)
+    av_task       = _fetch_alphavantage_overview(symbol)
+    yahoo_task    = asyncio.to_thread(_fetch_yahoo_fundamentals_sync, yahoo_symbol)
+    nse_task      = _fetch_nse_shareholding(symbol) if is_nse else asyncio.sleep(0, result={})
+    screener_task = _fetch_screener_shareholding(symbol) if is_nse else asyncio.sleep(0, result={})
 
-    td_data, av_data, yahoo_data, nse_data = await asyncio.gather(
-        td_task, av_task, yahoo_task, nse_task, return_exceptions=True
+    td_data, av_data, yahoo_data, nse_data, screener_data = await asyncio.gather(
+        td_task, av_task, yahoo_task, nse_task, screener_task, return_exceptions=True
     )
     if isinstance(td_data, Exception):
         logger.debug("TwelveData fundamentals raised: %s", td_data); td_data = {}
@@ -1739,6 +1824,8 @@ async def fetch_fundamentals(symbol: str, exchange: str = "NSE") -> Fundamentals
         logger.debug("Yahoo fundamentals raised: %s", yahoo_data); yahoo_data = {}
     if isinstance(nse_data, Exception):
         logger.debug("NSE shareholding raised: %s", nse_data); nse_data = {}
+    if isinstance(screener_data, Exception):
+        logger.debug("Screener shareholding raised: %s", screener_data); screener_data = {}
 
     # Merge: TwelveData → AlphaVantage → Yahoo (first non-None wins per field)
     def _first(*vals: Any) -> Optional[float]:
@@ -1767,38 +1854,50 @@ async def fetch_fundamentals(symbol: str, exchange: str = "NSE") -> Fundamentals
     sector        = av_data.get("sector") or yahoo_data.get("sector") or SECTOR_MAP.get(symbol.upper(), "")
     industry      = av_data.get("industry") or yahoo_data.get("industry") or ""
 
-    # Shareholding: NSE API → TwelveData insiders proxy → Yahoo insider proxy
+    # ---------------------------------------------------------------------------
+    # Shareholding: 4-layer fallback so data is ALWAYS populated when available
+    # Layer 1: NSE shareholding-pattern API  (exact data, may be blocked by NSE)
+    # Layer 2: Screener.in scrape            (most reliable for Indian stocks)
+    # Layer 3: TwelveData insider proxy      (not Indian-specific but usable)
+    # Layer 4: Yahoo insider proxy           (last resort)
+    # ---------------------------------------------------------------------------
     promoter_holding = nse_data.get("promoter_holding")
     fii              = nse_data.get("fii_holding")
     dii              = nse_data.get("dii_holding")
     promoter_pledge  = nse_data.get("promoter_pledge")
-    nse_available    = any(v is not None for v in nse_data.values())
-    if nse_available:
+
+    if any(v is not None for v in (promoter_holding, fii, dii)):
         sources.append("nse")
+    elif any(v is not None for v in screener_data.values()):
+        # Layer 2: Screener.in
+        promoter_holding = screener_data.get("promoter_holding")
+        fii              = screener_data.get("fii_holding")
+        dii              = screener_data.get("dii_holding")
+        promoter_pledge  = screener_data.get("promoter_pledge") or promoter_pledge
+        sources.append("screener")
+    else:
+        # Layer 3 & 4: insider/institution % proxies
+        if promoter_holding is None:
+            for proxy_data, proxy_label in [
+                (td_data, "twelvedata-insider-proxy"),
+                (yahoo_data, "yahoo-insider-proxy"),
+            ]:
+                if proxy_data.get("insider_pct") is not None:
+                    promoter_holding = proxy_data["insider_pct"]
+                    sources.append(proxy_label)
+                    break
 
-    # Fallback promoter proxy: TwelveData insider % → Yahoo insider %
-    if promoter_holding is None:
-        for proxy_src, proxy_data, proxy_label in [
-            ("td_insider_proxy", td_data, "twelvedata-insider-proxy"),
-            ("yf_insider_proxy", yahoo_data, "yahoo-insider-proxy"),
-        ]:
-            if proxy_data.get("insider_pct") is not None:
-                promoter_holding = proxy_data["insider_pct"]
-                sources.append(proxy_label)
-                break
-
-    # Fallback FII+DII proxy: TwelveData institutions % → Yahoo institutions %
-    if fii is None and dii is None:
-        for proxy_data, proxy_label in [
-            (td_data, "twelvedata-institutions-proxy"),
-            (yahoo_data, "yahoo-institutions-proxy"),
-        ]:
-            if proxy_data.get("institutions_pct") is not None:
-                combined = proxy_data["institutions_pct"]
-                fii = combined / 2
-                dii = combined / 2
-                sources.append(proxy_label)
-                break
+        if fii is None and dii is None:
+            for proxy_data, proxy_label in [
+                (td_data, "twelvedata-institutions-proxy"),
+                (yahoo_data, "yahoo-institutions-proxy"),
+            ]:
+                if proxy_data.get("institutions_pct") is not None:
+                    combined = proxy_data["institutions_pct"]
+                    fii = combined / 2
+                    dii = combined / 2
+                    sources.append(proxy_label)
+                    break
 
     logger.info(
         "Fundamentals %s: pe=%s d/e=%s roe=%s rev_g=%s sources=%s",
