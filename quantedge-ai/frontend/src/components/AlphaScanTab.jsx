@@ -4,7 +4,7 @@ import {
   LineChart as LineIcon, RefreshCw, Rocket, ShieldAlert, Sparkles,
   Target, TrendingDown, TrendingUp, Trophy, X, Zap,
 } from 'lucide-react';
-import { C, FONT_MONO } from '../constants.js';
+import { C, FONT_MONO, API_BASE } from '../constants.js';
 import { Spinner, Section, LiveBtn, ScoreRing, Tag, ProbBadge, MarketStatusBanner, GateCard } from './shared.jsx';
 import { fmt, fmtPct, formatCrore, formatDateTime } from '../utils/format.js';
 import {
@@ -456,7 +456,7 @@ function DeepAnalyzePanel({ backendDown }) {
       >
         {backendDown && (
           <div style={{ color: C.red, fontSize: 12 }}>
-            Backend unreachable — start it with <code>./start.sh</code>.
+            Backend unreachable — check that the server is running at <code>{API_BASE || window.location.origin}</code>.
           </div>
         )}
         {error && <div style={{ color: C.red, fontSize: 13 }}>{error}</div>}
@@ -527,18 +527,12 @@ export function AlphaScanTab({ state, log, runScan, backendDown }) {
             }}
           >
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: C.red, fontWeight: 700, marginBottom: 8 }}>
-              <ShieldAlert size={16} /> Backend unreachable on localhost:8000
+              <ShieldAlert size={16} /> Backend unreachable
             </div>
-            <div style={{ fontSize: 12, color: C.sub, marginBottom: 6 }}>
-              Start the FastAPI server in a separate terminal:
+            <div style={{ fontSize: 12, color: C.sub }}>
+              The API server at <code>{API_BASE || window.location.origin}</code> is not responding.
+              {API_BASE ? ' It may be starting up — wait 30s and try again.' : ' Check your deployment.'}
             </div>
-            <pre
-              style={{
-                margin: 0, padding: '0.75rem', background: C.dark,
-                border: `1px solid ${C.border}`, borderRadius: 8,
-                fontFamily: FONT_MONO, fontSize: 12, color: C.sub, overflowX: 'auto',
-              }}
-            >{`cd backend\npip install -r requirements.txt\npython main.py`}</pre>
           </div>
         )}
       </Section>
