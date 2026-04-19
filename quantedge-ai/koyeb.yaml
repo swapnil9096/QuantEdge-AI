@@ -54,6 +54,10 @@ volumes:
     size: 1
 
 env:
+  # ── Secrets: set these in the Koyeb dashboard under "Secrets", not here ──
+  # SECRET_KEY      → random hex: python3 -c "import secrets; print(secrets.token_hex(32))"
+  # ADMIN_PASSWORD  → strong password for the default admin account
+  # MASTER_PASSWORD → (optional) auto-unlocks the encrypted vault on startup
   - key: APP_ENV
     value: production
   - key: LOG_LEVEL

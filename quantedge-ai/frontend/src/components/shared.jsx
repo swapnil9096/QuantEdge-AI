@@ -1,10 +1,5 @@
 import React from 'react';
-import {
-  Activity,
-  AlertTriangle,
-  CheckCircle2,
-  XCircle,
-} from 'lucide-react';
+import { AlertTriangle, CheckCircle2, XCircle } from 'lucide-react';
 import { C, FONT_MONO, GRAD } from '../constants.js';
 
 // ---------------------------------------------------------------------------

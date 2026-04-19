@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { Sparkles, Zap, UserPlus, Shield, TrendingUp, BarChart2, Cpu } from 'lucide-react';
-import { C, FONT_MONO, GRAD } from '../constants.js';
+import { C, GRAD } from '../constants.js';
 import { Spinner } from './shared.jsx';
 import { apiAuthLogin, apiAuthRegister } from '../utils/api.js';
 
@@ -52,14 +52,9 @@ export function AuthScreen({ onLoggedIn }) {
   };
 
   return (
-    <div style={{
-      minHeight: '100vh',
-      display: 'grid',
-      gridTemplateColumns: '1fr 1fr',
-      background: C.bg,
-    }}>
+    <div className="qe-auth-grid">
       {/* ── Left panel — brand / features ───────────────────────────── */}
-      <div style={{
+      <div className="qe-auth-brand" style={{
         display: 'flex',
         flexDirection: 'column',
         justifyContent: 'center',
@@ -146,7 +141,7 @@ export function AuthScreen({ onLoggedIn }) {
       </div>
 
       {/* ── Right panel — form ───────────────────────────────────────── */}
-      <div style={{
+      <div className="qe-auth-form-col" style={{
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',

@@ -1,7 +1,5 @@
 /* QuantEdge AI — global styles */
-
-/* ─── Google Fonts ──────────────────────────────────────────────────────── */
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+/* Fonts loaded via <link> in index.html — no @import needed here */
 
 /* ─── Design tokens ─────────────────────────────────────────────────────── */
 :root {
@@ -140,3 +138,36 @@ input, select, textarea { font-family: inherit; }
 }
 
 .fade-up { animation: qe-fade-up 0.3s var(--ease) both; }
+
+/* ─── Global input focus ──────────────────────────────────────────────────── */
+input:focus, textarea:focus, select:focus {
+  outline: none;
+  border-color: rgba(0, 212, 168, 0.45) !important;
+  box-shadow: 0 0 0 3px rgba(0, 212, 168, 0.1) !important;
+}
+
+/* ─── Auth screen responsive layout ──────────────────────────────────────── */
+.qe-auth-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  min-height: 100vh;
+  background: var(--bg);
+}
+
+@media (max-width: 768px) {
+  .qe-auth-grid {
+    grid-template-columns: 1fr;
+  }
+  .qe-auth-brand {
+    display: none;
+  }
+  .qe-auth-form-col {
+    padding: 2rem 1.25rem;
+    align-items: flex-start;
+    padding-top: 3rem;
+  }
+}
+
+/* ─── Tab nav scrollbar hide ─────────────────────────────────────────────── */
+nav::-webkit-scrollbar { display: none; }
+nav { -ms-overflow-style: none; scrollbar-width: none; }

@@ -5,7 +5,7 @@
 export const C = {
   bg:     '#050810',
   card:   'rgba(15, 20, 35, 0.85)',
-  dark:   'rgba(8, 12, 24, 0.9)',
+  dark:   '#080c18',
   border: 'rgba(255, 255, 255, 0.07)',
   border2:'rgba(255, 255, 255, 0.12)',
   muted:  '#475569',
