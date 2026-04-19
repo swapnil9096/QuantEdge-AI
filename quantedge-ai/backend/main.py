@@ -100,6 +100,13 @@ ANGEL_TOTP_SECRET = os.getenv("ANGEL_TOTP_SECRET", "")
 ANGEL_API_KEY = os.getenv("ANGEL_API_KEY", "")
 
 # ---------------------------------------------------------------------------
+# Broker enable flag (real-money trading)
+# ---------------------------------------------------------------------------
+# Set BROKER_ENABLED=true in your environment / Render dashboard to enable
+# real Angel One order placement. Defaults to false — safe for paper trading.
+BROKER_ENABLED: bool = os.getenv("BROKER_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+
+# ---------------------------------------------------------------------------
 # Multi-user auth
 # ---------------------------------------------------------------------------
 # SECRET_KEY signs user JWTs. Set it in your environment/Render dashboard.
@@ -5871,6 +5878,19 @@ async def broker_delete_credentials(user: dict = Depends(get_current_user)) -> d
             (uid, *_BROKER_CRED_KEYS),
         )
     return {"ok": True}
+
+
+def _assert_broker_enabled() -> None:
+    """Raise 503 if real-money broker trading is disabled via BROKER_ENABLED env var."""
+    if not BROKER_ENABLED:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "broker_disabled",
+                "message": "Real-money broker trading is disabled on this server. "
+                           "Set BROKER_ENABLED=true in your environment to enable it.",
+            },
+        )
 
 
 @app.get("/broker/status")
