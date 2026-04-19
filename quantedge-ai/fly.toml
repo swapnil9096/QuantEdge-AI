@@ -19,7 +19,11 @@ primary_region = "bom"
   SESSION_TTL_HOURS = "24"
   PORT = "8000"
 
-  # These non-secrets can live here; rotate via `fly secrets set` when needed.
+  # ── SECRETS — set these via `fly secrets set KEY=value`, NOT here ──────────
+  # fly secrets set SECRET_KEY="$(openssl rand -hex 32)"
+  # fly secrets set ADMIN_PASSWORD="your-strong-password"
+  # fly secrets set MASTER_PASSWORD="your-vault-password"   # optional, enables auto-unlock
+  # ── Non-secrets can live here ─────────────────────────────────────────────
   PAPER_CAPITAL = "1000000"
   PAPER_RISK_PCT = "2.0"
   PAPER_MAX_OPEN = "5"

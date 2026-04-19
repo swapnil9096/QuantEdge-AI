@@ -11,29 +11,54 @@ export function TopKpiStrip({ watchlist, scanData, backtest, ml }) {
     (sd) => mlScoreFromData(sd) >= 80,
   ).length;
   const bestModel = ml?.models?.find((m) => m.best)?.name || '—';
+
   return (
-    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, padding: '1rem 1.5rem 0' }}>
-      <KpiCard icon={<Eye size={14} />} label="Watchlist" value={watchlist.length} color={C.teal} />
-      <KpiCard icon={<Search size={14} />} label="Scanned" value={scannedCount} color={C.blue} />
+    <div style={{
+      display: 'flex', flexWrap: 'wrap', gap: 10,
+      padding: '1rem 1.5rem 0.25rem',
+    }}>
       <KpiCard
-        icon={<Trophy size={14} />}
-        label="High Prob (≥80)"
+        icon={<Eye size={13} />}
+        label="Watchlist"
+        value={watchlist.length}
+        sub="symbols tracked"
+        color={C.teal}
+      />
+      <KpiCard
+        icon={<Search size={13} />}
+        label="Scanned"
+        value={scannedCount}
+        sub="last scan"
+        color={C.blue}
+      />
+      <KpiCard
+        icon={<Trophy size={13} />}
+        label="High Prob ≥80"
         value={highProbCount}
+        sub="trade setups"
         color={C.green}
       />
       <KpiCard
-        icon={<TrendingUp size={14} />}
-        label="Win rate"
+        icon={<TrendingUp size={13} />}
+        label="Win Rate"
         value={backtest ? `${fmt(backtest.win_rate, 1)}%` : '—'}
+        sub={backtest ? 'backtest result' : 'run backtest'}
         color={C.yellow}
       />
       <KpiCard
-        icon={<Gauge size={14} />}
-        label="Sharpe"
+        icon={<Gauge size={13} />}
+        label="Sharpe Ratio"
         value={backtest ? fmt(backtest.sharpe_ratio) : '—'}
+        sub={backtest ? `Sortino ${fmt(backtest.sortino_ratio)}` : '—'}
         color={C.purple}
       />
-      <KpiCard icon={<Cpu size={14} />} label="Best model" value={bestModel} color={C.orange} />
+      <KpiCard
+        icon={<Cpu size={13} />}
+        label="Best Model"
+        value={bestModel}
+        sub={ml ? `${ml.models?.length || 0} models trained` : 'run ML training'}
+        color={C.orange}
+      />
     </div>
   );
 }

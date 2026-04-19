@@ -49,7 +49,7 @@ import httpx
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -99,9 +99,89 @@ ANGEL_PASSWORD = os.getenv("ANGEL_PASSWORD", "")
 ANGEL_TOTP_SECRET = os.getenv("ANGEL_TOTP_SECRET", "")
 ANGEL_API_KEY = os.getenv("ANGEL_API_KEY", "")
 
+# ---------------------------------------------------------------------------
+# Broker enable flag (real-money trading)
+# ---------------------------------------------------------------------------
 # Set BROKER_ENABLED=true in your environment / Render dashboard to enable
-# real-money Angel One trading.  Defaults to disabled for safety.
+# real Angel One order placement. Defaults to false — safe for paper trading.
 BROKER_ENABLED: bool = os.getenv("BROKER_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+
+# ---------------------------------------------------------------------------
+# Multi-user auth
+# ---------------------------------------------------------------------------
+# SECRET_KEY signs user JWTs. Set it in your environment/Render dashboard.
+# If not set we generate a random one — tokens will be invalidated on restart.
+SECRET_KEY: str = os.getenv("SECRET_KEY", "")
+if not SECRET_KEY:
+    SECRET_KEY = _secrets_mod.token_hex(32) if "_secrets_mod" in dir() else os.urandom(32).hex()
+    logger.warning("SECRET_KEY not set — using random key; all user sessions will be lost on server restart.")
+
+USER_JWT_TTL_SECONDS = int(os.getenv("USER_JWT_TTL_HOURS", "720")) * 3600  # 30 days default
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+# bcrypt — optional at import time so server still starts without it
+try:
+    import bcrypt as _bcrypt_mod
+    _BCRYPT_OK = True
+except ImportError:
+    _bcrypt_mod = None
+    _BCRYPT_OK = False
+    logger.warning("bcrypt not installed. User registration/login will fail.")
+
+
+def _hash_password(password: str) -> str:
+    if not _BCRYPT_OK:
+        raise RuntimeError("bcrypt not installed — run: pip install bcrypt")
+    return _bcrypt_mod.hashpw(password.encode(), _bcrypt_mod.gensalt()).decode()
+
+
+def _verify_password(plain: str, hashed: str) -> bool:
+    if not _BCRYPT_OK:
+        return False
+    try:
+        return _bcrypt_mod.checkpw(plain.encode(), hashed.encode())
+    except Exception:
+        return False
+
+
+def _issue_user_token(user_id: int, username: str, is_admin: bool = False) -> dict[str, Any]:
+    now = int(time.time())
+    payload = {
+        "sub": user_id,
+        "username": username,
+        "is_admin": is_admin,
+        "iat": now,
+        "exp": now + USER_JWT_TTL_SECONDS,
+    }
+    token = _jwt.encode(payload, SECRET_KEY, algorithm="HS256")
+    if isinstance(token, bytes):
+        token = token.decode("utf-8")
+    return {
+        "token": token,
+        "expires_in": USER_JWT_TTL_SECONDS,
+        "user_id": user_id,
+        "username": username,
+        "is_admin": is_admin,
+    }
+
+
+def _verify_user_token(authorization: Optional[str]) -> Optional[dict[str, Any]]:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        return None
+    token = authorization.split(" ", 1)[1].strip()
+    try:
+        payload = _jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        return {
+            "user_id": int(payload["sub"]),
+            "username": str(payload.get("username", "")),
+            "is_admin": bool(payload.get("is_admin", False)),
+        }
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +230,7 @@ _API_PATH_PREFIXES: tuple[str, ...] = (
     "/lock-status",
     "/unlock",
     "/lock",
+    "/auth/",
     "/market-status",
     "/market-holidays",
     "/proxy/",
@@ -173,20 +254,23 @@ _API_PATH_PREFIXES: tuple[str, ...] = (
     "/redoc",
 )
 
-# Paths that remain accessible while the vault is locked. Everything else
-# behind the auth gate returns 401.
+# Paths that do NOT require a user JWT — open to all callers.
 _PUBLIC_PATHS: set[str] = {
     "/health",
     "/lock-status",
     "/unlock",
+    "/lock",
     "/market-status",
     "/market-holidays",
     "/api-info",
+    "/auth/register",
+    "/auth/login",
 }
 _PUBLIC_PREFIXES: tuple[str, ...] = (
     "/docs",
     "/openapi.json",
     "/redoc",
+    "/ws/",           # WebSocket auth handled inside the endpoint
 )
 
 
@@ -439,62 +523,63 @@ app = FastAPI(
     version="2.0.0",
 )
 
+# CORS — allow requests from the frontend origin.
+# Set FRONTEND_URL env var to your Vercel URL (e.g. https://quantedge.vercel.app).
+# Falls back to ["*"] in dev / single-domain deployments.
+_frontend_url = os.getenv("FRONTEND_URL", "").rstrip("/")
+_cors_origins = [_frontend_url] if _frontend_url else ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
-    allow_credentials=False,
+    allow_credentials=bool(_frontend_url),
 )
 
 
 @app.middleware("http")
-async def _secrets_gate(request: Any, call_next):
-    """Every request except the public set must carry a valid session JWT and
-    find the vault unlocked. If the vault isn't configured yet we still serve
-    the public routes so the UI can render a setup-needed screen."""
+async def _auth_gate(request: Any, call_next):
+    """JWT-based user auth gate. Public paths pass through. Everything else
+    requires a valid user token issued by POST /auth/login."""
     from starlette.responses import JSONResponse
 
     path = request.url.path
     method = request.method.upper()
 
-    # Frontend (StaticFiles) paths: anything that isn't an API route. Always
-    # allowed so the SPA + its assets render even when the vault is locked.
+    # SPA static assets — always pass through
     if not _is_api_path(path):
         return await call_next(request)
 
+    # CORS preflight and public API paths — always pass through
     if method == "OPTIONS" or _path_is_public(path):
         return await call_next(request)
 
-    if not vault.configured:
-        return JSONResponse(
-            status_code=409,
-            content={
-                "code": "not_configured",
-                "message": (
-                    "Secrets vault not configured. "
-                    "Run `python scripts/setup_secrets.py` on the server."
-                ),
-            },
-        )
-    if not vault.unlocked:
+    # Verify user JWT
+    user = _verify_user_token(request.headers.get("Authorization"))
+    if not user:
         return JSONResponse(
             status_code=401,
             content={
-                "code": "locked",
-                "message": "Vault is locked. POST /unlock with your master password.",
-                "configured": True,
+                "code": "unauthorized",
+                "message": "Login required. POST /auth/login with your credentials.",
             },
         )
-    if not _verify_bearer_token(request.headers.get("Authorization")):
-        return JSONResponse(
-            status_code=401,
-            content={
-                "code": "locked",
-                "message": "Missing or expired session token. Re-enter password to unlock.",
-            },
-        )
+
+    # Attach user context to request state for downstream Depends
+    request.state.user_id = user["user_id"]
+    request.state.username = user["username"]
+    request.state.is_admin = user["is_admin"]
     return await call_next(request)
+
+
+def get_current_user(request: Request) -> dict[str, Any]:
+    """FastAPI dependency — returns the authenticated user dict from request state."""
+    return {
+        "user_id": request.state.user_id,
+        "username": request.state.username,
+        "is_admin": request.state.is_admin,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -3041,6 +3126,95 @@ async def telegram_send_high_probability(symbol: str, score: int) -> None:
     await _tg_send(msg)
 
 
+def _init_user_schema() -> None:
+    """Create users, user_paper_settings, user_secrets tables and migrate existing data."""
+    with _db_lock, _db_connect() as conn:
+        # Users table
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                username      TEXT UNIQUE NOT NULL,
+                email         TEXT UNIQUE,
+                password_hash TEXT NOT NULL,
+                created_at    TEXT NOT NULL,
+                is_active     INTEGER NOT NULL DEFAULT 1,
+                is_admin      INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        # Per-user Angel One and other broker credentials (AES-GCM encrypted)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_secrets (
+                user_id  INTEGER NOT NULL,
+                key      TEXT NOT NULL,
+                value    TEXT NOT NULL,
+                PRIMARY KEY (user_id, key),
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+            """
+        )
+        # Per-user paper trading settings
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_paper_settings (
+                user_id                          INTEGER PRIMARY KEY,
+                auto_trade_enabled               INTEGER NOT NULL DEFAULT 0,
+                auto_trade_threshold             REAL    NOT NULL DEFAULT 90.0,
+                auto_trade_market_open_only      INTEGER NOT NULL DEFAULT 1,
+                starting_capital                 REAL    NOT NULL DEFAULT 1000000,
+                risk_per_trade_pct               REAL    NOT NULL DEFAULT 1.0,
+                max_open_positions               INTEGER NOT NULL DEFAULT 5,
+                max_hold_days                    INTEGER NOT NULL DEFAULT 20,
+                telegram_on_open                 INTEGER NOT NULL DEFAULT 1,
+                telegram_on_close                INTEGER NOT NULL DEFAULT 1,
+                telegram_on_error                INTEGER NOT NULL DEFAULT 1,
+                telegram_on_high_probability     INTEGER NOT NULL DEFAULT 1,
+                telegram_high_probability_threshold INTEGER NOT NULL DEFAULT 85,
+                telegram_daily_summary           INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+            """
+        )
+        # Add user_id column to paper_trades if missing (safe migration)
+        existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(paper_trades)")}
+        if "user_id" not in existing_cols:
+            conn.execute("ALTER TABLE paper_trades ADD COLUMN user_id INTEGER REFERENCES users(id)")
+        # Add user_id column to broker_orders if table exists
+        broker_cols = {row[1] for row in conn.execute("PRAGMA table_info(broker_orders)")}
+        if broker_cols and "user_id" not in broker_cols:
+            conn.execute("ALTER TABLE broker_orders ADD COLUMN user_id INTEGER REFERENCES users(id)")
+
+    # Create default admin user if no users exist yet; assign orphaned records to them
+    with _db_lock, _db_connect() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        if count == 0 and _BCRYPT_OK:
+            default_pwd = os.getenv("ADMIN_PASSWORD", "admin123")
+            conn.execute(
+                "INSERT INTO users (username, password_hash, created_at, is_admin) VALUES (?,?,?,1)",
+                ("admin", _hash_password(default_pwd), _now_iso()),
+            )
+            logger.info(
+                "Created default admin user (username=admin). "
+                "Change password via POST /auth/change-password after first login. "
+                "Default password from ADMIN_PASSWORD env var (fallback: admin123)."
+            )
+        admin = conn.execute("SELECT id FROM users WHERE is_admin=1 ORDER BY id LIMIT 1").fetchone()
+        if admin:
+            admin_id = admin["id"]
+            conn.execute(
+                "UPDATE paper_trades SET user_id=? WHERE user_id IS NULL", (admin_id,)
+            )
+            # Ensure admin has a paper settings row
+            conn.execute(
+                "INSERT OR IGNORE INTO user_paper_settings (user_id) VALUES (?)", (admin_id,)
+            )
+
+
+_init_user_schema()
+
+
 def _init_paper_schema() -> None:
     with _db_lock, _db_connect() as conn:
         conn.execute(
@@ -3163,45 +3337,64 @@ _init_broker_schema()
 # ---- Helpers -------------------------------------------------------------
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 def _row_to_trade_dict(row: sqlite3.Row) -> dict[str, Any]:
     d = dict(row)
     d["status"] = d["status"].upper()
     return d
 
 
-def _fetch_open_trade_for_symbol_sync(symbol: str) -> Optional[dict[str, Any]]:
+def _fetch_open_trade_for_symbol_sync(symbol: str, user_id: Optional[int] = None) -> Optional[dict[str, Any]]:
     with _db_connect() as conn:
-        row = conn.execute(
-            "SELECT * FROM paper_trades WHERE symbol = ? AND status = 'OPEN' ORDER BY id DESC LIMIT 1",
-            (symbol.upper(),),
-        ).fetchone()
+        if user_id is not None:
+            row = conn.execute(
+                "SELECT * FROM paper_trades WHERE symbol=? AND status='OPEN' AND user_id=? ORDER BY id DESC LIMIT 1",
+                (symbol.upper(), user_id),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM paper_trades WHERE symbol=? AND status='OPEN' ORDER BY id DESC LIMIT 1",
+                (symbol.upper(),),
+            ).fetchone()
     return _row_to_trade_dict(row) if row else None
 
 
-def _count_open_positions_sync() -> int:
+def _count_open_positions_sync(user_id: Optional[int] = None) -> int:
     with _db_connect() as conn:
-        row = conn.execute(
-            "SELECT COUNT(*) AS n FROM paper_trades WHERE status = 'OPEN'"
-        ).fetchone()
+        if user_id is not None:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM paper_trades WHERE status='OPEN' AND user_id=?", (user_id,)
+            ).fetchone()
+        else:
+            row = conn.execute("SELECT COUNT(*) AS n FROM paper_trades WHERE status='OPEN'").fetchone()
     return int(row["n"] if row else 0)
 
 
-def _sum_realized_pnl_sync() -> float:
+def _sum_realized_pnl_sync(user_id: Optional[int] = None) -> float:
     with _db_connect() as conn:
-        row = conn.execute(
-            "SELECT COALESCE(SUM(pnl_amount), 0) AS total FROM paper_trades WHERE status = 'CLOSED'"
-        ).fetchone()
+        if user_id is not None:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(pnl_amount),0) AS total FROM paper_trades WHERE status='CLOSED' AND user_id=?",
+                (user_id,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(pnl_amount),0) AS total FROM paper_trades WHERE status='CLOSED'"
+            ).fetchone()
     return float(row["total"] if row else 0.0)
 
 
-def _list_trades_sync(status: Optional[str] = None, symbol: Optional[str] = None, limit: int = 100) -> list[dict[str, Any]]:
+def _list_trades_sync(
+    status: Optional[str] = None,
+    symbol: Optional[str] = None,
+    limit: int = 100,
+    user_id: Optional[int] = None,
+) -> list[dict[str, Any]]:
     limit = max(1, min(int(limit), 500))
     clauses: list[str] = []
     params: list[Any] = []
+    if user_id is not None:
+        clauses.append("user_id = ?")
+        params.append(user_id)
     if status:
         clauses.append("status = ?")
         params.append(status.upper())
@@ -3223,23 +3416,27 @@ def _list_trades_sync(status: Optional[str] = None, symbol: Optional[str] = None
     return [_row_to_trade_dict(r) for r in rows]
 
 
-def _fetch_trade_sync(trade_id: int) -> Optional[dict[str, Any]]:
+def _fetch_trade_sync(trade_id: int, user_id: Optional[int] = None) -> Optional[dict[str, Any]]:
     with _db_connect() as conn:
-        row = conn.execute(
-            "SELECT * FROM paper_trades WHERE id = ?", (int(trade_id),)
-        ).fetchone()
+        if user_id is not None:
+            row = conn.execute(
+                "SELECT * FROM paper_trades WHERE id=? AND user_id=?", (int(trade_id), user_id)
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM paper_trades WHERE id=?", (int(trade_id),)
+            ).fetchone()
         if row is None:
             return None
         orders = conn.execute(
-            "SELECT * FROM paper_orders WHERE trade_id = ? ORDER BY id ASC",
-            (int(trade_id),),
+            "SELECT * FROM paper_orders WHERE trade_id=? ORDER BY id ASC", (int(trade_id),)
         ).fetchall()
     trade = _row_to_trade_dict(row)
     trade["orders"] = [dict(o) for o in orders]
     return trade
 
 
-def _insert_trade_sync(trade: dict[str, Any]) -> int:
+def _insert_trade_sync(trade: dict[str, Any], user_id: Optional[int] = None) -> int:
     """Insert an OPEN trade and its BUY order atomically."""
     with _db_lock, _db_connect() as conn:
         cursor = conn.execute(
@@ -3247,8 +3444,8 @@ def _insert_trade_sync(trade: dict[str, Any]) -> int:
             INSERT INTO paper_trades (
                 symbol, exchange, status, entry_price, stop_loss, target_price,
                 quantity, risk_amount, opened_at, max_hold_days, source,
-                history_id, combined_score, notes, last_price, last_marked_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                history_id, combined_score, notes, last_price, last_marked_at, user_id
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 trade["symbol"].upper(),
@@ -3267,6 +3464,7 @@ def _insert_trade_sync(trade: dict[str, Any]) -> int:
                 trade.get("notes"),
                 float(trade["entry_price"]),
                 trade.get("opened_at") or _now_iso(),
+                user_id,
             ),
         )
         tid = int(cursor.lastrowid or 0)
@@ -3404,6 +3602,94 @@ def _paper_settings_update(updates: dict[str, Any]) -> dict[str, Any]:
         return dict(_paper_settings)
 
 
+_PAPER_SETTINGS_DEFAULTS: dict[str, Any] = {
+    "auto_trade_enabled": False,
+    "auto_trade_threshold": 90.0,
+    "auto_trade_market_open_only": True,
+    "starting_capital": 1_000_000.0,
+    "risk_per_trade_pct": 1.0,
+    "max_open_positions": 5,
+    "max_hold_days": 20,
+    "telegram_on_open": True,
+    "telegram_on_close": True,
+    "telegram_on_error": True,
+    "telegram_on_high_probability": True,
+    "telegram_high_probability_threshold": 85,
+    "telegram_daily_summary": False,
+}
+
+
+def _get_user_paper_settings(user_id: int) -> dict[str, Any]:
+    """Load per-user paper settings from DB, falling back to defaults."""
+    with _db_lock, _db_connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM user_paper_settings WHERE user_id=?", (user_id,)
+        ).fetchone()
+    if row is None:
+        # Auto-create default row for this user
+        with _db_lock, _db_connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO user_paper_settings (user_id) VALUES (?)", (user_id,)
+            )
+        return dict(_PAPER_SETTINGS_DEFAULTS)
+    settings = dict(_PAPER_SETTINGS_DEFAULTS)
+    for k in settings:
+        col_val = row[k] if k in row.keys() else None
+        if col_val is not None:
+            if k in {"auto_trade_enabled", "auto_trade_market_open_only",
+                     "telegram_on_open", "telegram_on_close", "telegram_on_error",
+                     "telegram_on_high_probability", "telegram_daily_summary"}:
+                settings[k] = bool(col_val)
+            elif k in {"max_open_positions", "max_hold_days",
+                       "telegram_high_probability_threshold"}:
+                settings[k] = int(col_val)
+            else:
+                settings[k] = float(col_val)
+    return settings
+
+
+def _update_user_paper_settings(user_id: int, updates: dict[str, Any]) -> dict[str, Any]:
+    allowed_bool = {
+        "auto_trade_enabled", "auto_trade_market_open_only",
+        "telegram_on_open", "telegram_on_close", "telegram_on_error",
+        "telegram_on_high_probability", "telegram_daily_summary",
+    }
+    allowed_int = {
+        "max_open_positions", "max_hold_days", "telegram_high_probability_threshold",
+    }
+    allowed_float = {"risk_per_trade_pct", "starting_capital", "auto_trade_threshold"}
+    allowed = allowed_bool | allowed_int | allowed_float
+
+    # Ensure row exists
+    with _db_lock, _db_connect() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO user_paper_settings (user_id) VALUES (?)", (user_id,)
+        )
+        for k, v in updates.items():
+            if k not in allowed:
+                continue
+            if k in allowed_bool:
+                v = 1 if v else 0
+            elif k in allowed_int:
+                v = int(v)
+            else:
+                v = float(v)
+            conn.execute(
+                f"UPDATE user_paper_settings SET {k}=? WHERE user_id=?", (v, user_id)
+            )
+    return _get_user_paper_settings(user_id)
+
+
+def _user_paper_capital(user_id: int) -> float:
+    settings = _get_user_paper_settings(user_id)
+    with _db_lock, _db_connect() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(pnl_amount), 0) AS total FROM paper_trades WHERE status='CLOSED' AND user_id=?",
+            (user_id,),
+        ).fetchone()
+    return float(settings["starting_capital"]) + float(row["total"])
+
+
 # ---- Public APIs ---------------------------------------------------------
 
 
@@ -3417,13 +3703,14 @@ async def open_paper_trade(
     stop_loss: float,
     target_price: float,
     *,
+    user_id: Optional[int] = None,
     source: str = "manual",
     history_id: Optional[int] = None,
     combined_score: Optional[int] = None,
     exchange: str = "NSE",
     notes: Optional[str] = None,
 ) -> dict[str, Any]:
-    settings = _paper_settings_snapshot()
+    settings = _get_user_paper_settings(user_id) if user_id else _paper_settings_snapshot()
 
     # Validation
     if not (stop_loss < entry_price < target_price):
@@ -3431,20 +3718,23 @@ async def open_paper_trade(
             "Invalid levels: require stop_loss < entry_price < target_price."
         )
 
-    # Dedup — one OPEN position per symbol.
-    existing = await asyncio.to_thread(_fetch_open_trade_for_symbol_sync, symbol.upper())
+    # Dedup — one OPEN position per symbol per user.
+    existing = await asyncio.to_thread(_fetch_open_trade_for_symbol_sync, symbol.upper(), user_id)
     if existing:
         raise PaperTradeError(
             f"An open position for {symbol.upper()} already exists (#{existing['id']})."
         )
 
-    open_count = await asyncio.to_thread(_count_open_positions_sync)
+    open_count = await asyncio.to_thread(_count_open_positions_sync, user_id)
     if open_count >= settings["max_open_positions"]:
         raise PaperTradeError(
             f"Max open positions reached ({open_count}/{settings['max_open_positions']})."
         )
 
-    equity = await asyncio.to_thread(_current_equity_sync)
+    if user_id:
+        equity = _user_paper_capital(user_id)
+    else:
+        equity = await asyncio.to_thread(_current_equity_sync)
     risk_rupees = equity * (settings["risk_per_trade_pct"] / 100)
     qty = _compute_qty(entry_price, stop_loss, risk_rupees)
     if qty <= 0:
@@ -3466,10 +3756,10 @@ async def open_paper_trade(
         "notes": notes,
         "opened_at": _now_iso(),
     }
-    tid = await asyncio.to_thread(_insert_trade_sync, payload)
+    tid = await asyncio.to_thread(_insert_trade_sync, payload, user_id)
     logger.info(
-        "Paper trade #%d OPEN %s qty=%d entry=%.2f stop=%.2f target=%.2f risk=₹%.0f source=%s",
-        tid, symbol.upper(), qty, entry_price, stop_loss, target_price, risk_rupees, source,
+        "Paper trade #%d OPEN %s qty=%d entry=%.2f stop=%.2f target=%.2f risk=₹%.0f source=%s user=%s",
+        tid, symbol.upper(), qty, entry_price, stop_loss, target_price, risk_rupees, source, user_id,
     )
     return await asyncio.to_thread(_fetch_trade_sync, tid)
 
@@ -3914,6 +4204,17 @@ async def _monitor_loop() -> None:
 @app.on_event("startup")
 async def _start_background_tasks() -> None:
     global _monitor_task, _price_poll_task
+
+    # Auto-unlock vault if MASTER_PASSWORD env var is set so API keys
+    # (TwelveData, Anthropic, etc.) are available without a manual unlock step.
+    master_pwd = os.getenv("MASTER_PASSWORD", "")
+    if master_pwd and vault.configured and not vault.unlocked:
+        ok = vault.unlock(master_pwd)
+        if ok:
+            logger.info("Vault auto-unlocked via MASTER_PASSWORD env var.")
+        else:
+            logger.warning("MASTER_PASSWORD set but vault unlock failed — check password.")
+
     if _monitor_task is None or _monitor_task.done():
         _monitor_task = asyncio.create_task(_monitor_loop())
     if _price_poll_task is None or _price_poll_task.done():
@@ -4089,6 +4390,123 @@ async def unlock_endpoint(req: UnlockRequest) -> dict[str, Any]:
 async def lock_endpoint() -> dict[str, Any]:
     vault.lock()
     return {"locked": True}
+
+
+# ---------------------------------------------------------------------------
+# User auth endpoints
+# ---------------------------------------------------------------------------
+
+
+class AuthRegisterRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=40, pattern=r"^[a-zA-Z0-9_\-]+$")
+    password: str = Field(min_length=6, max_length=128)
+    email: Optional[str] = None
+
+
+class AuthLoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=40)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=6, max_length=128)
+
+
+@app.post("/auth/register")
+async def auth_register(req: AuthRegisterRequest) -> dict[str, Any]:
+    if not _BCRYPT_OK:
+        raise HTTPException(status_code=501, detail="passlib[bcrypt] not installed on server.")
+    with _db_lock, _db_connect() as conn:
+        existing = conn.execute(
+            "SELECT id FROM users WHERE username=?", (req.username,)
+        ).fetchone()
+        if existing:
+            raise HTTPException(status_code=409, detail="Username already taken.")
+        user_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        is_admin = 1 if user_count == 0 else 0  # first user becomes admin
+        conn.execute(
+            "INSERT INTO users (username, email, password_hash, created_at, is_admin) VALUES (?,?,?,?,?)",
+            (req.username, req.email, _hash_password(req.password), _now_iso(), is_admin),
+        )
+        user_id = conn.execute(
+            "SELECT id FROM users WHERE username=?", (req.username,)
+        ).fetchone()["id"]
+        conn.execute(
+            "INSERT OR IGNORE INTO user_paper_settings (user_id) VALUES (?)", (user_id,)
+        )
+    logger.info("New user registered: %s (id=%d, admin=%s)", req.username, user_id, bool(is_admin))
+    return {"ok": True, **_issue_user_token(user_id, req.username, bool(is_admin))}
+
+
+@app.post("/auth/login")
+async def auth_login(req: AuthLoginRequest) -> dict[str, Any]:
+    if not _BCRYPT_OK:
+        raise HTTPException(status_code=501, detail="passlib[bcrypt] not installed on server.")
+    with _db_lock, _db_connect() as conn:
+        row = conn.execute(
+            "SELECT id, password_hash, is_admin, is_active FROM users WHERE username=?",
+            (req.username,),
+        ).fetchone()
+    if not row or not _verify_password(req.password, row["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid username or password.")
+    if not row["is_active"]:
+        raise HTTPException(status_code=403, detail="Account is disabled.")
+    return {"ok": True, **_issue_user_token(row["id"], req.username, bool(row["is_admin"]))}
+
+
+@app.get("/auth/me")
+async def auth_me(user: dict = Depends(get_current_user)) -> dict[str, Any]:
+    with _db_lock, _db_connect() as conn:
+        row = conn.execute(
+            "SELECT id, username, email, created_at, is_admin FROM users WHERE id=?",
+            (user["user_id"],),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found.")
+    return dict(row)
+
+
+@app.post("/auth/change-password")
+async def auth_change_password(
+    req: ChangePasswordRequest, user: dict = Depends(get_current_user)
+) -> dict[str, Any]:
+    with _db_lock, _db_connect() as conn:
+        row = conn.execute(
+            "SELECT password_hash FROM users WHERE id=?", (user["user_id"],)
+        ).fetchone()
+    if not row or not _verify_password(req.current_password, row["password_hash"]):
+        raise HTTPException(status_code=401, detail="Current password is incorrect.")
+    with _db_lock, _db_connect() as conn:
+        conn.execute(
+            "UPDATE users SET password_hash=? WHERE id=?",
+            (_hash_password(req.new_password), user["user_id"]),
+        )
+    return {"ok": True, "message": "Password changed successfully."}
+
+
+# Admin-only: list all users
+@app.get("/auth/users")
+async def auth_list_users(user: dict = Depends(get_current_user)) -> dict[str, Any]:
+    if not user["is_admin"]:
+        raise HTTPException(status_code=403, detail="Admin only.")
+    with _db_lock, _db_connect() as conn:
+        rows = conn.execute(
+            "SELECT id, username, email, created_at, is_admin, is_active FROM users ORDER BY id"
+        ).fetchall()
+    return {"users": [dict(r) for r in rows]}
+
+
+# Admin-only: deactivate a user
+@app.patch("/auth/users/{uid}/deactivate")
+async def auth_deactivate_user(uid: int, user: dict = Depends(get_current_user)) -> dict[str, Any]:
+    if not user["is_admin"]:
+        raise HTTPException(status_code=403, detail="Admin only.")
+    if uid == user["user_id"]:
+        raise HTTPException(status_code=400, detail="Cannot deactivate your own account.")
+    with _db_lock, _db_connect() as conn:
+        conn.execute("UPDATE users SET is_active=0 WHERE id=?", (uid,))
+    return {"ok": True}
 
 
 def _build_claude_route() -> tuple[str, dict[str, str], str]:
@@ -4495,19 +4913,40 @@ class PaperSettingsUpdate(BaseModel):
 
 
 @app.get("/paper-portfolio")
-async def paper_portfolio() -> dict[str, Any]:
-    return await paper_portfolio_snapshot()
+async def paper_portfolio(user: dict = Depends(get_current_user)) -> dict[str, Any]:
+    uid = user["user_id"]
+    settings = _get_user_paper_settings(uid)
+    open_trades = await asyncio.to_thread(_list_trades_sync, "OPEN", None, 200, uid)
+    closed_trades = await asyncio.to_thread(_list_trades_sync, "CLOSED", None, 500, uid)
+    equity = _user_paper_capital(uid)
+    total_open_pnl = sum(
+        (t.get("last_price", t["entry_price"]) - t["entry_price"]) * t["quantity"]
+        for t in open_trades
+    )
+    closed_pnl = _sum_realized_pnl_sync(uid)
+    return {
+        "open_positions": open_trades,
+        "closed_trades_count": len(closed_trades),
+        "open_count": len(open_trades),
+        "realized_pnl": closed_pnl,
+        "unrealized_pnl": total_open_pnl,
+        "equity": equity,
+        "starting_capital": settings["starting_capital"],
+        "settings": settings,
+    }
 
 
 @app.get("/paper-settings")
-async def paper_settings_get() -> dict[str, Any]:
-    return _paper_settings_snapshot()
+async def paper_settings_get(user: dict = Depends(get_current_user)) -> dict[str, Any]:
+    return _get_user_paper_settings(user["user_id"])
 
 
 @app.patch("/paper-settings")
-async def paper_settings_patch(update: PaperSettingsUpdate) -> dict[str, Any]:
+async def paper_settings_patch(
+    update: PaperSettingsUpdate, user: dict = Depends(get_current_user)
+) -> dict[str, Any]:
     payload = {k: v for k, v in update.model_dump().items() if v is not None}
-    return _paper_settings_update(payload)
+    return _update_user_paper_settings(user["user_id"], payload)
 
 
 @app.get("/paper-trades")
@@ -4515,27 +4954,31 @@ async def list_paper_trades(
     status: Optional[str] = None,
     symbol: Optional[str] = None,
     limit: int = 100,
+    user: dict = Depends(get_current_user),
 ) -> dict[str, Any]:
-    trades = await asyncio.to_thread(_list_trades_sync, status, symbol, limit)
+    trades = await asyncio.to_thread(_list_trades_sync, status, symbol, limit, user["user_id"])
     return {"count": len(trades), "items": trades}
 
 
 @app.get("/paper-trades/{trade_id}")
-async def get_paper_trade(trade_id: int) -> dict[str, Any]:
-    trade = await asyncio.to_thread(_fetch_trade_sync, trade_id)
+async def get_paper_trade(trade_id: int, user: dict = Depends(get_current_user)) -> dict[str, Any]:
+    trade = await asyncio.to_thread(_fetch_trade_sync, trade_id, user["user_id"])
     if trade is None:
         raise HTTPException(status_code=404, detail=f"Paper trade {trade_id} not found.")
     return trade
 
 
 @app.post("/paper-trades")
-async def create_paper_trade(req: PaperOpenRequest) -> dict[str, Any]:
+async def create_paper_trade(
+    req: PaperOpenRequest, user: dict = Depends(get_current_user)
+) -> dict[str, Any]:
     try:
         return await open_paper_trade(
             req.symbol,
             req.entry_price,
             req.stop_loss,
             req.target_price,
+            user_id=user["user_id"],
             exchange=req.exchange,
             notes=req.notes,
             source="manual",
@@ -4545,7 +4988,13 @@ async def create_paper_trade(req: PaperOpenRequest) -> dict[str, Any]:
 
 
 @app.post("/paper-trades/{trade_id}/close")
-async def close_paper_trade_endpoint(trade_id: int, req: PaperCloseRequest) -> dict[str, Any]:
+async def close_paper_trade_endpoint(
+    trade_id: int, req: PaperCloseRequest, user: dict = Depends(get_current_user)
+) -> dict[str, Any]:
+    # Verify trade belongs to this user
+    trade = await asyncio.to_thread(_fetch_trade_sync, trade_id, user["user_id"])
+    if trade is None:
+        raise HTTPException(status_code=404, detail=f"Paper trade {trade_id} not found.")
     try:
         return await close_paper_trade(trade_id, price=req.price, reason=req.reason or EXIT_MANUAL)
     except PaperTradeError as exc:
@@ -4553,7 +5002,7 @@ async def close_paper_trade_endpoint(trade_id: int, req: PaperCloseRequest) -> d
 
 
 @app.post("/paper-trades/monitor-now")
-async def paper_monitor_now() -> dict[str, Any]:
+async def paper_monitor_now(user: dict = Depends(get_current_user)) -> dict[str, Any]:
     return await _monitor_open_positions_once()
 
 
@@ -4592,34 +5041,38 @@ async def telegram_test_endpoint() -> dict[str, Any]:
 # ---- Equity curve --------------------------------------------------------
 
 
-def _list_closed_trades_chrono_sync() -> list[dict[str, Any]]:
+def _list_closed_trades_chrono_sync(user_id: Optional[int] = None) -> list[dict[str, Any]]:
     """Return every CLOSED trade ordered by the moment it was closed."""
     with _db_connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, symbol, entry_price, close_price, quantity,
-                   pnl_amount, pnl_pct, exit_reason, opened_at, closed_at
-            FROM paper_trades
-            WHERE status = 'CLOSED' AND closed_at IS NOT NULL
-            ORDER BY closed_at ASC, id ASC
-            """
-        ).fetchall()
+        if user_id is not None:
+            rows = conn.execute(
+                """
+                SELECT id, symbol, entry_price, close_price, quantity,
+                       pnl_amount, pnl_pct, exit_reason, opened_at, closed_at
+                FROM paper_trades
+                WHERE status='CLOSED' AND closed_at IS NOT NULL AND user_id=?
+                ORDER BY closed_at ASC, id ASC
+                """,
+                (user_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT id, symbol, entry_price, close_price, quantity,
+                       pnl_amount, pnl_pct, exit_reason, opened_at, closed_at
+                FROM paper_trades
+                WHERE status = 'CLOSED' AND closed_at IS NOT NULL
+                ORDER BY closed_at ASC, id ASC
+                """
+            ).fetchall()
     return [dict(r) for r in rows]
 
 
-async def build_equity_curve() -> dict[str, Any]:
-    """Synthesize an equity + drawdown time series from the paper-trade ledger.
-
-    Start point is the starting capital; each closed trade step-changes the
-    running equity; the final point is a live "mark-to-market" that includes
-    any currently-open positions' unrealised P&L.
-
-    Drawdown at each point is `(equity - running_peak) / running_peak * 100`,
-    always 0 or negative.
-    """
-    settings = _paper_settings_snapshot()
+async def build_equity_curve(user_id: Optional[int] = None) -> dict[str, Any]:
+    """Synthesize an equity + drawdown time series from the paper-trade ledger."""
+    settings = _get_user_paper_settings(user_id) if user_id else _paper_settings_snapshot()
     starting_capital = float(settings["starting_capital"])
-    closed = await asyncio.to_thread(_list_closed_trades_chrono_sync)
+    closed = await asyncio.to_thread(_list_closed_trades_chrono_sync, user_id)
 
     points: list[dict[str, Any]] = []
     peak_equity = starting_capital
@@ -4719,9 +5172,9 @@ async def build_equity_curve() -> dict[str, Any]:
 
 
 @app.get("/paper-equity-curve")
-async def paper_equity_curve() -> dict[str, Any]:
+async def paper_equity_curve(user: dict = Depends(get_current_user)) -> dict[str, Any]:
     """Equity-curve time series for the Paper Trading Desk chart."""
-    return await build_equity_curve()
+    return await build_equity_curve(user["user_id"])
 
 
 @app.get("/market-status")
@@ -5310,24 +5763,60 @@ except ImportError:
     logger.warning("smartapi-python / pyotp not installed. Broker features disabled.")
 
 # --------------- In-memory session state ---------------
+_broker_sessions: dict[int, dict] = {}   # user_id → session dict
+_broker_sessions_lock = asyncio.Lock()
+
+# Keep the old single-session for backward compat with monitor loop
 _broker_lock = asyncio.Lock()
 _broker_session: dict = {
-    "connected": False,
-    "client_id": None,
-    "auth_token": None,
-    "feed_token": None,
-    "refresh_token": None,
-    "last_connected_at": None,
-    "obj": None,          # SmartConnect instance (or None)
+    "connected": False, "client_id": None, "auth_token": None,
+    "feed_token": None, "refresh_token": None, "last_connected_at": None, "obj": None,
 }
 
+_BROKER_CRED_KEYS = ("ANGEL_CLIENT_ID", "ANGEL_PASSWORD", "ANGEL_TOTP_SECRET", "ANGEL_API_KEY")
 
-def _broker_keys_configured() -> bool:
+
+def _user_broker_creds(user_id: int) -> dict[str, str]:
+    """Return Angel One credentials for a user from user_secrets, falling back to env."""
+    with _db_lock, _db_connect() as conn:
+        rows = conn.execute(
+            "SELECT key, value FROM user_secrets WHERE user_id=? AND key IN (?,?,?,?)",
+            (user_id, *_BROKER_CRED_KEYS),
+        ).fetchall()
+    creds = {r["key"]: r["value"] for r in rows}
+    # Fall back to global env vars if user hasn't set their own
+    return {
+        "ANGEL_CLIENT_ID": creds.get("ANGEL_CLIENT_ID") or ANGEL_CLIENT_ID,
+        "ANGEL_PASSWORD": creds.get("ANGEL_PASSWORD") or ANGEL_PASSWORD,
+        "ANGEL_TOTP_SECRET": creds.get("ANGEL_TOTP_SECRET") or ANGEL_TOTP_SECRET,
+        "ANGEL_API_KEY": creds.get("ANGEL_API_KEY") or ANGEL_API_KEY,
+    }
+
+
+def _broker_keys_configured(user_id: Optional[int] = None) -> bool:
+    if user_id is not None:
+        creds = _user_broker_creds(user_id)
+        return bool(creds["ANGEL_CLIENT_ID"] and creds["ANGEL_PASSWORD"]
+                    and creds["ANGEL_TOTP_SECRET"] and creds["ANGEL_API_KEY"])
     return bool(ANGEL_CLIENT_ID and ANGEL_PASSWORD and ANGEL_TOTP_SECRET and ANGEL_API_KEY)
 
 
-async def _get_smart_obj():
-    """Return the current authenticated SmartConnect object, or raise 503."""
+def _get_user_session(user_id: int) -> dict:
+    return _broker_sessions.setdefault(user_id, {
+        "connected": False, "client_id": None, "auth_token": None,
+        "feed_token": None, "refresh_token": None, "last_connected_at": None, "obj": None,
+    })
+
+
+async def _get_smart_obj(user_id: Optional[int] = None):
+    """Return authenticated SmartConnect object for the given user, or raise 503."""
+    if user_id is not None:
+        async with _broker_sessions_lock:
+            session = _get_user_session(user_id)
+            if not session["connected"] or session["obj"] is None:
+                raise HTTPException(status_code=503, detail="Broker not connected. Call POST /broker/connect first.")
+            return session["obj"]
+    # Legacy path (no user context)
     async with _broker_lock:
         if not _broker_session["connected"] or _broker_session["obj"] is None:
             raise HTTPException(status_code=503, detail="Broker not connected. Call POST /broker/connect first.")
@@ -5336,58 +5825,112 @@ async def _get_smart_obj():
 
 # --------------- Endpoints ---------------
 
+class BrokerCredentialsRequest(BaseModel):
+    angel_client_id: str
+    angel_password: str
+    angel_totp_secret: str
+    angel_api_key: str
+
+
+@app.post("/broker/credentials")
+async def broker_set_credentials(
+    req: BrokerCredentialsRequest, user: dict = Depends(get_current_user)
+) -> dict[str, Any]:
+    """Save per-user Angel One credentials (stored in user_secrets table)."""
+    uid = user["user_id"]
+    pairs = [
+        ("ANGEL_CLIENT_ID", req.angel_client_id.strip()),
+        ("ANGEL_PASSWORD", req.angel_password),
+        ("ANGEL_TOTP_SECRET", req.angel_totp_secret.strip()),
+        ("ANGEL_API_KEY", req.angel_api_key.strip()),
+    ]
+    with _db_lock, _db_connect() as conn:
+        for key, value in pairs:
+            conn.execute(
+                "INSERT OR REPLACE INTO user_secrets (user_id, key, value) VALUES (?,?,?)",
+                (uid, key, value),
+            )
+    return {"ok": True, "message": "Angel One credentials saved."}
+
+
+@app.get("/broker/credentials")
+async def broker_get_credentials(user: dict = Depends(get_current_user)) -> dict[str, Any]:
+    """Check which broker credentials are configured for the current user."""
+    uid = user["user_id"]
+    creds = _user_broker_creds(uid)
+    return {
+        "angel_client_id_set": bool(creds["ANGEL_CLIENT_ID"]),
+        "angel_password_set": bool(creds["ANGEL_PASSWORD"]),
+        "angel_totp_secret_set": bool(creds["ANGEL_TOTP_SECRET"]),
+        "angel_api_key_set": bool(creds["ANGEL_API_KEY"]),
+        "all_configured": _broker_keys_configured(uid),
+        "client_id_hint": creds["ANGEL_CLIENT_ID"][:3] + "***" if creds["ANGEL_CLIENT_ID"] else None,
+    }
+
+
+@app.delete("/broker/credentials")
+async def broker_delete_credentials(user: dict = Depends(get_current_user)) -> dict[str, Any]:
+    """Remove stored Angel One credentials for the current user."""
+    uid = user["user_id"]
+    with _db_lock, _db_connect() as conn:
+        conn.execute(
+            "DELETE FROM user_secrets WHERE user_id=? AND key IN (?,?,?,?)",
+            (uid, *_BROKER_CRED_KEYS),
+        )
+    return {"ok": True}
+
+
 def _assert_broker_enabled() -> None:
+    """Raise 503 if real-money broker trading is disabled via BROKER_ENABLED env var."""
     if not BROKER_ENABLED:
         raise HTTPException(
             status_code=503,
             detail={
                 "code": "broker_disabled",
-                "message": (
-                    "Real-money broker integration is currently disabled. "
-                    "Set BROKER_ENABLED=true in your environment to enable it."
-                ),
+                "message": "Real-money broker trading is disabled on this server. "
+                           "Set BROKER_ENABLED=true in your environment to enable it.",
             },
         )
 
 
 @app.get("/broker/status")
-async def broker_status():
-    """Return connection status and key-configuration flag."""
-    async with _broker_lock:
+async def broker_status(user: dict = Depends(get_current_user)) -> dict[str, Any]:
+    """Return connection status and key-configuration flag for the current user."""
+    uid = user["user_id"]
+    async with _broker_sessions_lock:
+        session = _get_user_session(uid)
         return {
             "enabled": BROKER_ENABLED,
-            "connected": _broker_session["connected"] if BROKER_ENABLED else False,
-            "client_id": _broker_session["client_id"],
-            "last_connected_at": _broker_session["last_connected_at"],
-            "keys_configured": _broker_keys_configured(),
+            "connected": session["connected"],
+            "client_id": session["client_id"],
+            "last_connected_at": session["last_connected_at"],
+            "keys_configured": _broker_keys_configured(uid),
             "smartapi_installed": _SMARTAPI_OK,
         }
 
 
 @app.post("/broker/connect")
-async def broker_connect():
+async def broker_connect(user: dict = Depends(get_current_user)) -> dict[str, Any]:
     """Authenticate with Angel One via TOTP and persist the session."""
     _assert_broker_enabled()
+    uid = user["user_id"]
     if not _SMARTAPI_OK:
-        raise HTTPException(status_code=501, detail="smartapi-python not installed. Run: pip install smartapi-python pyotp")
-    if not _broker_keys_configured():
+        raise HTTPException(status_code=501, detail="smartapi-python not installed.")
+    creds = _user_broker_creds(uid)
+    if not _broker_keys_configured(uid):
         raise HTTPException(
             status_code=400,
             detail=(
-                "Angel One API keys not configured. "
-                "Add them as environment variables in your hosting dashboard "
-                "(ANGEL_CLIENT_ID, ANGEL_PASSWORD, ANGEL_TOTP_SECRET, ANGEL_API_KEY), "
-                "or run: python scripts/setup_secrets.py --add-secret ANGEL_CLIENT_ID=... "
-                "--add-secret ANGEL_PASSWORD=... --add-secret ANGEL_TOTP_SECRET=... "
-                "--add-secret ANGEL_API_KEY=..."
+                "Angel One credentials not configured. "
+                "POST /broker/credentials with your Angel One keys first."
             ),
         )
     try:
-        obj = _SmartConnect(api_key=ANGEL_API_KEY)
-        totp_val = _pyotp.TOTP(ANGEL_TOTP_SECRET).now()
+        obj = _SmartConnect(api_key=creds["ANGEL_API_KEY"])
+        totp_val = _pyotp.TOTP(creds["ANGEL_TOTP_SECRET"]).now()
         data = await asyncio.get_event_loop().run_in_executor(
             None,
-            lambda: obj.generateSession(ANGEL_CLIENT_ID, ANGEL_PASSWORD, totp_val),
+            lambda: obj.generateSession(creds["ANGEL_CLIENT_ID"], creds["ANGEL_PASSWORD"], totp_val),
         )
         if not data or data.get("status") is False:
             msg = data.get("message", "Authentication failed") if data else "No response from Angel One"
@@ -5396,51 +5939,50 @@ async def broker_connect():
         auth_token = session_data.get("jwtToken", "")
         refresh_token = session_data.get("refreshToken", "")
         feed_token = await asyncio.get_event_loop().run_in_executor(None, obj.getfeedToken)
-        async with _broker_lock:
-            _broker_session.update({
+        async with _broker_sessions_lock:
+            _get_user_session(uid).update({
                 "connected": True,
-                "client_id": ANGEL_CLIENT_ID,
+                "client_id": creds["ANGEL_CLIENT_ID"],
                 "auth_token": auth_token,
                 "feed_token": feed_token,
                 "refresh_token": refresh_token,
                 "last_connected_at": _now_iso(),
                 "obj": obj,
             })
-        logger.info("Broker connected for client %s", ANGEL_CLIENT_ID)
-        return {"ok": True, "message": f"Connected as {ANGEL_CLIENT_ID}"}
+        logger.info("Broker connected: user=%d client=%s", uid, creds["ANGEL_CLIENT_ID"])
+        return {"ok": True, "message": f"Connected as {creds['ANGEL_CLIENT_ID']}"}
     except HTTPException:
         raise
     except Exception as exc:
-        logger.error("Broker connect failed: %s", exc)
+        logger.error("Broker connect failed (user=%d): %s", uid, exc)
         raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.post("/broker/disconnect")
-async def broker_disconnect():
-    """Terminate the Angel One session."""
-    async with _broker_lock:
-        obj = _broker_session.get("obj")
+async def broker_disconnect(user: dict = Depends(get_current_user)) -> dict[str, Any]:
+    """Terminate the Angel One session for the current user."""
+    uid = user["user_id"]
+    async with _broker_sessions_lock:
+        session = _get_user_session(uid)
+        obj = session.get("obj")
+        client_id = session.get("client_id") or ""
         if obj is not None:
             try:
-                await asyncio.get_event_loop().run_in_executor(None, obj.terminateSession, ANGEL_CLIENT_ID)
+                await asyncio.get_event_loop().run_in_executor(None, obj.terminateSession, client_id)
             except Exception:
-                pass  # log but don't fail
-        _broker_session.update({
-            "connected": False,
-            "client_id": None,
-            "auth_token": None,
-            "feed_token": None,
-            "refresh_token": None,
-            "obj": None,
+                pass
+        session.update({
+            "connected": False, "client_id": None, "auth_token": None,
+            "feed_token": None, "refresh_token": None, "obj": None,
         })
-    logger.info("Broker disconnected.")
+    logger.info("Broker disconnected: user=%d", uid)
     return {"ok": True}
 
 
 @app.get("/broker/funds")
-async def broker_funds():
+async def broker_funds(user: dict = Depends(get_current_user)) -> dict[str, Any]:
     _assert_broker_enabled()
-    obj = await _get_smart_obj()
+    obj = await _get_smart_obj(user["user_id"])
     try:
         data = await asyncio.get_event_loop().run_in_executor(None, obj.rmsLimit)
         if not data or data.get("status") is False:
@@ -5457,9 +5999,9 @@ async def broker_funds():
 
 
 @app.get("/broker/positions")
-async def broker_positions():
+async def broker_positions(user: dict = Depends(get_current_user)) -> dict[str, Any]:
     _assert_broker_enabled()
-    obj = await _get_smart_obj()
+    obj = await _get_smart_obj(user["user_id"])
     try:
         data = await asyncio.get_event_loop().run_in_executor(None, obj.position)
         if not data or data.get("status") is False:
@@ -5492,9 +6034,9 @@ async def broker_positions():
 
 
 @app.get("/broker/holdings")
-async def broker_holdings():
+async def broker_holdings(user: dict = Depends(get_current_user)) -> dict[str, Any]:
     _assert_broker_enabled()
-    obj = await _get_smart_obj()
+    obj = await _get_smart_obj(user["user_id"])
     try:
         data = await asyncio.get_event_loop().run_in_executor(None, obj.holding)
         if not data or data.get("status") is False:
@@ -5525,9 +6067,9 @@ async def broker_holdings():
 
 
 @app.get("/broker/orders")
-async def broker_orders_list():
+async def broker_orders_list(user: dict = Depends(get_current_user)) -> dict[str, Any]:
     _assert_broker_enabled()
-    obj = await _get_smart_obj()
+    obj = await _get_smart_obj(user["user_id"])
     try:
         data = await asyncio.get_event_loop().run_in_executor(None, obj.orderBook)
         if not data or data.get("status") is False:
@@ -5567,14 +6109,17 @@ class BrokerOrderRequest(BaseModel):
 
 
 @app.post("/broker/order")
-async def broker_place_order(req: BrokerOrderRequest):
+async def broker_place_order(
+    req: BrokerOrderRequest, user: dict = Depends(get_current_user)
+) -> dict[str, Any]:
     _assert_broker_enabled()
-    obj = await _get_smart_obj()
+    uid = user["user_id"]
+    obj = await _get_smart_obj(uid)
     try:
         params = {
             "variety": "NORMAL",
             "tradingsymbol": req.symbol.upper(),
-            "symboltoken": "",          # Angel One resolves by symbol name
+            "symboltoken": "",
             "transactiontype": req.side.upper(),
             "exchange": req.exchange.upper(),
             "ordertype": req.order_type.upper(),
@@ -5591,36 +6136,38 @@ async def broker_place_order(req: BrokerOrderRequest):
             msg = result.get("message", "Order rejected") if result else "No response"
             raise HTTPException(status_code=400, detail=msg)
         order_id = result.get("data", {}).get("orderid", "") if isinstance(result.get("data"), dict) else result.get("data", "")
-        # Persist to local DB
         with _db() as conn:
             conn.execute(
                 """INSERT INTO broker_orders
-                   (order_id, symbol, exchange, side, qty, price, order_type, status, placed_at, response)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                   (order_id, symbol, exchange, side, qty, price, order_type, status, placed_at, response, user_id)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                 (str(order_id), req.symbol.upper(), req.exchange.upper(), req.side.upper(),
-                 req.qty, req.price, req.order_type.upper(), "PENDING", _now_iso(), json.dumps(result)),
+                 req.qty, req.price, req.order_type.upper(), "PENDING", _now_iso(), json.dumps(result), uid),
             )
-        logger.info("Broker order placed: %s %s %s x%d → order_id=%s", req.side, req.symbol, req.order_type, req.qty, order_id)
+        logger.info("Broker order placed: user=%d %s %s x%d → order_id=%s", uid, req.side, req.symbol, req.qty, order_id)
         return {"ok": True, "order_id": order_id, "message": result.get("message", "Order placed")}
     except HTTPException:
         raise
     except Exception as exc:
-        logger.error("Broker place order failed: %s", exc)
+        logger.error("Broker place order failed (user=%d): %s", uid, exc)
         raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.post("/broker/sync-paper/{trade_id}")
-async def broker_sync_paper(trade_id: int):
+async def broker_sync_paper(
+    trade_id: int, user: dict = Depends(get_current_user)
+) -> dict[str, Any]:
     """Replicate a paper trade as a real Angel One order."""
     _assert_broker_enabled()
+    uid = user["user_id"]
     with _db() as conn:
         row = conn.execute(
-            "SELECT symbol, side, qty, entry_price, status FROM paper_trades WHERE id=?",
-            (trade_id,),
+            "SELECT symbol, side, qty, entry_price, status FROM paper_trades WHERE id=? AND user_id=?",
+            (trade_id, uid),
         ).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Paper trade not found")
-    if row["status"] != "open":
+    if row["status"] != "OPEN":
         raise HTTPException(status_code=400, detail="Only open paper trades can be synced")
     req = BrokerOrderRequest(
         symbol=row["symbol"],
@@ -5629,7 +6176,7 @@ async def broker_sync_paper(trade_id: int):
         order_type="MARKET",
         price=0.0,
     )
-    result = await broker_place_order(req)
+    result = await broker_place_order(req, user)
     # Link the broker order to the paper trade
     with _db() as conn:
         conn.execute(
