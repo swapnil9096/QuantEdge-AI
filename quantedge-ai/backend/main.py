@@ -99,6 +99,10 @@ ANGEL_PASSWORD = os.getenv("ANGEL_PASSWORD", "")
 ANGEL_TOTP_SECRET = os.getenv("ANGEL_TOTP_SECRET", "")
 ANGEL_API_KEY = os.getenv("ANGEL_API_KEY", "")
 
+# Set BROKER_ENABLED=true in your environment / Render dashboard to enable
+# real-money Angel One trading.  Defaults to disabled for safety.
+BROKER_ENABLED: bool = os.getenv("BROKER_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+
 
 # ---------------------------------------------------------------------------
 # Secrets vault (encrypted at rest, password-unlocked at runtime)
@@ -293,25 +297,35 @@ vault = SecretsVault()
 def _reload_secret_globals(d: dict[str, str]) -> None:
     """Push the decrypted (or empty) secrets into module globals so existing
     call sites (e.g. `_build_claude_route`) pick up the values with no
-    refactor. Called from vault.unlock() and vault.lock()."""
+    refactor. Called from vault.unlock() and vault.lock().
+
+    Vault values take priority; env vars are kept as fallback so that secrets
+    set in the hosting dashboard (Render, Koyeb, fly.io) continue to work even
+    when the vault file does not contain a particular key.
+    """
     global TWELVEDATA_API_KEY, ALPHA_VANTAGE_API_KEY, POLYGON_API_KEY
     global OPENAI_API_KEY, ANTHROPIC_API_KEY
     global PORTKEY_API_KEY, PORTKEY_VIRTUAL_KEY, PORTKEY_CONFIG
     global TELEGRAM_BOT_TOKEN
     global ANGEL_CLIENT_ID, ANGEL_PASSWORD, ANGEL_TOTP_SECRET, ANGEL_API_KEY
-    TWELVEDATA_API_KEY = d.get("TWELVEDATA_API_KEY", "")
-    ALPHA_VANTAGE_API_KEY = d.get("ALPHA_VANTAGE_API_KEY", "")
-    POLYGON_API_KEY = d.get("POLYGON_API_KEY", "")
-    OPENAI_API_KEY = d.get("OPENAI_API_KEY", "")
-    ANTHROPIC_API_KEY = d.get("ANTHROPIC_API_KEY", "")
-    PORTKEY_API_KEY = d.get("PORTKEY_API_KEY", "")
-    PORTKEY_VIRTUAL_KEY = d.get("PORTKEY_VIRTUAL_KEY", "")
-    PORTKEY_CONFIG = d.get("PORTKEY_CONFIG", "")
-    TELEGRAM_BOT_TOKEN = d.get("TELEGRAM_BOT_TOKEN", "")
-    ANGEL_CLIENT_ID = d.get("ANGEL_CLIENT_ID", "")
-    ANGEL_PASSWORD = d.get("ANGEL_PASSWORD", "")
-    ANGEL_TOTP_SECRET = d.get("ANGEL_TOTP_SECRET", "")
-    ANGEL_API_KEY = d.get("ANGEL_API_KEY", "")
+
+    def _val(key: str) -> str:
+        # Vault value wins; fall back to the env var set at startup.
+        return d.get(key) or os.getenv(key, "")
+
+    TWELVEDATA_API_KEY = _val("TWELVEDATA_API_KEY")
+    ALPHA_VANTAGE_API_KEY = _val("ALPHA_VANTAGE_API_KEY")
+    POLYGON_API_KEY = _val("POLYGON_API_KEY")
+    OPENAI_API_KEY = _val("OPENAI_API_KEY")
+    ANTHROPIC_API_KEY = _val("ANTHROPIC_API_KEY")
+    PORTKEY_API_KEY = _val("PORTKEY_API_KEY")
+    PORTKEY_VIRTUAL_KEY = _val("PORTKEY_VIRTUAL_KEY")
+    PORTKEY_CONFIG = _val("PORTKEY_CONFIG")
+    TELEGRAM_BOT_TOKEN = _val("TELEGRAM_BOT_TOKEN")
+    ANGEL_CLIENT_ID = _val("ANGEL_CLIENT_ID")
+    ANGEL_PASSWORD = _val("ANGEL_PASSWORD")
+    ANGEL_TOTP_SECRET = _val("ANGEL_TOTP_SECRET")
+    ANGEL_API_KEY = _val("ANGEL_API_KEY")
 
 
 def _issue_session_token() -> dict[str, Any]:
@@ -5322,12 +5336,27 @@ async def _get_smart_obj():
 
 # --------------- Endpoints ---------------
 
+def _assert_broker_enabled() -> None:
+    if not BROKER_ENABLED:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "broker_disabled",
+                "message": (
+                    "Real-money broker integration is currently disabled. "
+                    "Set BROKER_ENABLED=true in your environment to enable it."
+                ),
+            },
+        )
+
+
 @app.get("/broker/status")
 async def broker_status():
     """Return connection status and key-configuration flag."""
     async with _broker_lock:
         return {
-            "connected": _broker_session["connected"],
+            "enabled": BROKER_ENABLED,
+            "connected": _broker_session["connected"] if BROKER_ENABLED else False,
             "client_id": _broker_session["client_id"],
             "last_connected_at": _broker_session["last_connected_at"],
             "keys_configured": _broker_keys_configured(),
@@ -5338,10 +5367,21 @@ async def broker_status():
 @app.post("/broker/connect")
 async def broker_connect():
     """Authenticate with Angel One via TOTP and persist the session."""
+    _assert_broker_enabled()
     if not _SMARTAPI_OK:
         raise HTTPException(status_code=501, detail="smartapi-python not installed. Run: pip install smartapi-python pyotp")
     if not _broker_keys_configured():
-        raise HTTPException(status_code=400, detail="Angel One credentials not configured. Add them to the vault.")
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Angel One API keys not configured. "
+                "Add them as environment variables in your hosting dashboard "
+                "(ANGEL_CLIENT_ID, ANGEL_PASSWORD, ANGEL_TOTP_SECRET, ANGEL_API_KEY), "
+                "or run: python scripts/setup_secrets.py --add-secret ANGEL_CLIENT_ID=... "
+                "--add-secret ANGEL_PASSWORD=... --add-secret ANGEL_TOTP_SECRET=... "
+                "--add-secret ANGEL_API_KEY=..."
+            ),
+        )
     try:
         obj = _SmartConnect(api_key=ANGEL_API_KEY)
         totp_val = _pyotp.TOTP(ANGEL_TOTP_SECRET).now()
@@ -5399,6 +5439,7 @@ async def broker_disconnect():
 
 @app.get("/broker/funds")
 async def broker_funds():
+    _assert_broker_enabled()
     obj = await _get_smart_obj()
     try:
         data = await asyncio.get_event_loop().run_in_executor(None, obj.rmsLimit)
@@ -5417,6 +5458,7 @@ async def broker_funds():
 
 @app.get("/broker/positions")
 async def broker_positions():
+    _assert_broker_enabled()
     obj = await _get_smart_obj()
     try:
         data = await asyncio.get_event_loop().run_in_executor(None, obj.position)
@@ -5451,6 +5493,7 @@ async def broker_positions():
 
 @app.get("/broker/holdings")
 async def broker_holdings():
+    _assert_broker_enabled()
     obj = await _get_smart_obj()
     try:
         data = await asyncio.get_event_loop().run_in_executor(None, obj.holding)
@@ -5483,6 +5526,7 @@ async def broker_holdings():
 
 @app.get("/broker/orders")
 async def broker_orders_list():
+    _assert_broker_enabled()
     obj = await _get_smart_obj()
     try:
         data = await asyncio.get_event_loop().run_in_executor(None, obj.orderBook)
@@ -5524,6 +5568,7 @@ class BrokerOrderRequest(BaseModel):
 
 @app.post("/broker/order")
 async def broker_place_order(req: BrokerOrderRequest):
+    _assert_broker_enabled()
     obj = await _get_smart_obj()
     try:
         params = {
@@ -5567,6 +5612,7 @@ async def broker_place_order(req: BrokerOrderRequest):
 @app.post("/broker/sync-paper/{trade_id}")
 async def broker_sync_paper(trade_id: int):
     """Replicate a paper trade as a real Angel One order."""
+    _assert_broker_enabled()
     with _db() as conn:
         row = conn.execute(
             "SELECT symbol, side, qty, entry_price, status FROM paper_trades WHERE id=?",
