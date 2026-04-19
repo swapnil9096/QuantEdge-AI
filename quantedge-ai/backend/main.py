@@ -523,18 +523,25 @@ app = FastAPI(
     version="2.0.0",
 )
 
-# CORS — allow requests from the frontend origin.
-# Set FRONTEND_URL env var to your Vercel URL (e.g. https://quantedge.vercel.app).
-# Falls back to ["*"] in dev / single-domain deployments.
-_frontend_url = os.getenv("FRONTEND_URL", "").rstrip("/")
-_cors_origins = [_frontend_url] if _frontend_url else ["*"]
-
+# CORS — always allow all origins.
+#
+# Auth uses JWT Bearer tokens, NOT cookies, so allow_credentials=False is both
+# correct and required when allow_origins=["*"]. A wildcard origin is safe here
+# because there are no session cookies that CSRF could hijack; every request
+# must carry a signed JWT.  Restricting to a specific FRONTEND_URL would cause
+# Starlette to respond with "400 Disallowed CORS origin" on any mismatch —
+# e.g. preview branches, local dev, or a FRONTEND_URL env-var typo — which
+# breaks login silently and is impossible to debug from the frontend.
+#
+# FRONTEND_URL is still used as documentation in render.yaml and vercel.json
+# but is NOT consulted for CORS enforcement here.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_cors_origins,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
-    allow_credentials=bool(_frontend_url),
+    allow_credentials=False,
+    expose_headers=["*"],
 )
 
 
@@ -5758,15 +5765,20 @@ async def ws_live_prices(websocket: WebSocket) -> None:
 # ---------------------------------------------------------------------------
 
 # SmartAPI optional imports (graceful degradation when not installed).
+# The module was renamed from 'SmartApi' → 'smartapi' in smartapi-python v1.4+;
+# try both so the code works across package versions.
 try:
-    from SmartApi import SmartConnect as _SmartConnect  # type: ignore
+    try:
+        from SmartApi import SmartConnect as _SmartConnect  # type: ignore  # ≤1.3.x
+    except ImportError:
+        from smartapi import SmartConnect as _SmartConnect  # type: ignore  # ≥1.4.x
     import pyotp as _pyotp  # type: ignore
     _SMARTAPI_OK = True
-except ImportError:
+except ImportError as _smartapi_err:
     _SmartConnect = None  # type: ignore
     _pyotp = None  # type: ignore
     _SMARTAPI_OK = False
-    logger.warning("smartapi-python / pyotp not installed. Broker features disabled.")
+    logger.warning("Broker features disabled: %s", _smartapi_err)
 
 # --------------- In-memory session state ---------------
 _broker_sessions: dict[int, dict] = {}   # user_id → session dict
