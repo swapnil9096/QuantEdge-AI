@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useEffect } from 'react';
 import {
-  Brain, Building2, ChevronRight, Cpu, LineChart as LineIcon,
+  Brain, Building2, Cpu, LineChart as LineIcon,
   Rocket, Search,
 } from 'lucide-react';
 import { C, API_BASE, TOKEN_KEY } from './constants.js';
@@ -226,12 +226,12 @@ export default function App() {
       <Header lastScan={lastScan} lastError={lastError} onLogout={handleLogout} wsConnected={wsConnected} currentUser={currentUser} />
       <TopKpiStrip watchlist={watchlist} scanData={scanData} backtest={backtest} ml={ml} />
 
-      <nav
-        style={{
-          display: 'flex', gap: 4, padding: '0.75rem 1.5rem 0',
-          borderBottom: `1px solid ${C.border}`, overflowX: 'auto',
-        }}
-      >
+      {/* Tab nav */}
+      <nav style={{
+        display: 'flex', gap: 2, padding: '0.85rem 1.5rem 0',
+        borderBottom: '1px solid rgba(255,255,255,0.06)',
+        overflowX: 'auto',
+      }}>
         {TABS.map((tab) => {
           const active = tab.id === activeTab;
           return (
@@ -240,22 +240,29 @@ export default function App() {
               onClick={() => setActiveTab(tab.id)}
               style={{
                 display: 'inline-flex', alignItems: 'center', gap: 6,
-                padding: '0.55rem 1rem', border: 'none',
+                padding: '0.5rem 1rem',
+                border: 'none',
                 borderBottom: `2px solid ${active ? C.teal : 'transparent'}`,
-                background: 'transparent',
+                background: active ? 'rgba(0,212,168,0.06)' : 'transparent',
+                borderRadius: '8px 8px 0 0',
                 color: active ? C.teal : C.muted,
-                fontWeight: 600, fontSize: 13, cursor: 'pointer',
+                fontWeight: active ? 700 : 500,
+                fontSize: 13, cursor: 'pointer',
+                transition: 'all 0.15s ease',
+                whiteSpace: 'nowrap',
+                letterSpacing: 0.1,
               }}
+              onMouseEnter={(e) => { if (!active) e.currentTarget.style.color = C.sub; }}
+              onMouseLeave={(e) => { if (!active) e.currentTarget.style.color = C.muted; }}
             >
               {tab.icon}
               {tab.label}
-              {active && <ChevronRight size={12} />}
             </button>
           );
         })}
       </nav>
 
-      <main style={{ padding: '1.25rem 1.5rem 3rem', maxWidth: 1400, margin: '0 auto' }}>
+      <main style={{ padding: '1.25rem 1.5rem 4rem', maxWidth: 1400, margin: '0 auto' }}>
         {activeTab === 'scanner' && (
           <ScannerTab
             watchlist={watchlist}

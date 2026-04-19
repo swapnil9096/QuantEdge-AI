@@ -1,29 +1,39 @@
 // ---------------------------------------------------------------------------
-// Palette
+// Palette + design tokens
 // ---------------------------------------------------------------------------
 
 export const C = {
-  bg: '#0a0e1a',
-  card: '#111827',
-  border: '#1f2937',
-  muted: '#6b7280',
-  text: '#e2e8f0',
-  sub: '#cbd5e1',
-  teal: '#00d4a8',
-  blue: '#4d9fff',
+  bg:     '#050810',
+  card:   'rgba(15, 20, 35, 0.85)',
+  dark:   'rgba(8, 12, 24, 0.9)',
+  border: 'rgba(255, 255, 255, 0.07)',
+  border2:'rgba(255, 255, 255, 0.12)',
+  muted:  '#475569',
+  sub:    '#94a3b8',
+  text:   '#f1f5f9',
+  teal:   '#00d4a8',
+  blue:   '#4d9fff',
   purple: '#a78bfa',
   yellow: '#fbbf24',
-  green: '#4ade80',
-  red: '#f87171',
+  green:  '#4ade80',
+  red:    '#f87171',
   orange: '#f0883e',
-  dark: '#0d1526',
+  // Glass helpers
+  glass:        'rgba(255,255,255,0.03)',
+  glassBorder:  'rgba(255,255,255,0.07)',
+  shadow:       '0 1px 3px rgba(0,0,0,0.3), 0 8px 32px rgba(0,0,0,0.25), inset 0 1px 0 rgba(255,255,255,0.04)',
+};
+
+export const GRAD = {
+  teal:   'linear-gradient(135deg, #00d4a8 0%, #4d9fff 100%)',
+  purple: 'linear-gradient(135deg, #a78bfa 0%, #4d9fff 100%)',
+  red:    'linear-gradient(135deg, #f87171 0%, #f0883e 100%)',
+  green:  'linear-gradient(135deg, #4ade80 0%, #00d4a8 100%)',
 };
 
 export const FONT_MONO = "'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace";
 
 // API base URL. In dev (Vite on :3000) we hit the backend on :8000 directly.
-// In production the backend serves the built frontend on the same origin so
-// relative URLs are correct.
 export const API_BASE = (() => {
   const envOverride = import.meta.env.VITE_API_BASE;
   if (envOverride) return envOverride.replace(/\/$/, '');

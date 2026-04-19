@@ -1,107 +1,142 @@
-/* QuantEdge AI — global shell styles (everything else is inline per spec). */
+/* QuantEdge AI — global styles */
 
+/* ─── Google Fonts ──────────────────────────────────────────────────────── */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+
+/* ─── Design tokens ─────────────────────────────────────────────────────── */
 :root {
   color-scheme: dark;
+
+  --bg:           #050810;
+  --surface:      rgba(15, 20, 35, 0.85);
+  --surface-2:    rgba(20, 27, 46, 0.9);
+  --border:       rgba(255, 255, 255, 0.07);
+  --border-2:     rgba(255, 255, 255, 0.12);
+  --text:         #f1f5f9;
+  --sub:          #94a3b8;
+  --muted:        #475569;
+  --teal:         #00d4a8;
+  --blue:         #4d9fff;
+  --purple:       #a78bfa;
+  --yellow:       #fbbf24;
+  --green:        #4ade80;
+  --red:          #f87171;
+  --orange:       #f0883e;
+
+  --radius-sm:    8px;
+  --radius-md:    12px;
+  --radius-lg:    16px;
+  --radius-xl:    20px;
+
+  --ease:         cubic-bezier(0.4, 0, 0.2, 1);
+  --transition:   0.18s var(--ease);
+  --transition-slow: 0.3s var(--ease);
+
+  --shadow-card:  0 1px 3px rgba(0,0,0,0.3), 0 8px 32px rgba(0,0,0,0.25), inset 0 1px 0 rgba(255,255,255,0.04);
+  --shadow-glow-teal: 0 0 24px rgba(0,212,168,0.18);
+  --shadow-glow-blue: 0 0 24px rgba(77,159,255,0.18);
 }
 
-* {
-  box-sizing: border-box;
-}
+/* ─── Reset & base ───────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; }
 
-html,
-body,
-#root {
+html, body, #root {
   margin: 0;
   padding: 0;
   min-height: 100vh;
-  background: #0a0e1a;
-  color: #e2e8f0;
+  background: var(--bg);
+  color: var(--text);
   font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
   font-size: 14px;
-  line-height: 1.55;
+  line-height: 1.6;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-a {
-  color: inherit;
+/* Ambient background mesh */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background:
+    radial-gradient(ellipse 60% 40% at 15% 10%, rgba(0,212,168,0.055) 0%, transparent 60%),
+    radial-gradient(ellipse 50% 50% at 85% 85%, rgba(77,159,255,0.045) 0%, transparent 60%),
+    radial-gradient(ellipse 40% 60% at 50% 50%, rgba(167,139,250,0.02) 0%, transparent 70%);
+  pointer-events: none;
+  z-index: 0;
 }
 
-button {
-  font-family: inherit;
-}
+#root { position: relative; z-index: 1; }
 
-input,
-select,
-textarea {
-  font-family: inherit;
-}
+a { color: inherit; }
+button { font-family: inherit; cursor: pointer; }
+input, select, textarea { font-family: inherit; }
 
-/* Keyframes shared across inline components */
+/* ─── Scrollbar ──────────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 99px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.18); }
 
+/* ─── Selection ──────────────────────────────────────────────────────────── */
+::selection { background: rgba(0,212,168,0.25); color: var(--text); }
+
+/* ─── Animations ─────────────────────────────────────────────────────────── */
 @keyframes qe-spin {
-  to {
-    transform: rotate(360deg);
-  }
+  to { transform: rotate(360deg); }
 }
 
 @keyframes qe-pulse {
-  0%,
-  100% {
-    opacity: 1;
-    transform: scale(1);
-  }
-  50% {
-    opacity: 0.55;
-    transform: scale(1.15);
-  }
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 0.5; transform: scale(1.2); }
+}
+
+@keyframes qe-fade-up {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
 
 @keyframes qe-fade-in {
-  from {
-    opacity: 0;
-    transform: translateY(6px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
+  from { opacity: 0; }
+  to   { opacity: 1; }
 }
 
 @keyframes qe-ring-draw {
-  from {
-    stroke-dashoffset: var(--ring-circ, 377);
-  }
-  to {
-    stroke-dashoffset: var(--ring-target, 0);
-  }
+  from { stroke-dashoffset: var(--ring-circ, 377); }
+  to   { stroke-dashoffset: var(--ring-target, 0); }
 }
 
 @keyframes qe-shimmer {
-  0% {
-    background-position: -200% 0;
-  }
-  100% {
-    background-position: 200% 0;
-  }
+  0%   { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
 }
 
-/* Scrollbar */
-
-::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
+@keyframes qe-glow-pulse {
+  0%, 100% { box-shadow: 0 0 16px rgba(0,212,168,0.3); }
+  50%       { box-shadow: 0 0 28px rgba(0,212,168,0.55); }
 }
 
-::-webkit-scrollbar-track {
-  background: #0a0e1a;
+@keyframes qe-gradient-shift {
+  0%   { background-position: 0% 50%; }
+  50%  { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
 }
 
-::-webkit-scrollbar-thumb {
-  background: #1f2937;
-  border-radius: 6px;
+/* ─── Utility classes ────────────────────────────────────────────────────── */
+.glass {
+  background: var(--surface);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-card);
 }
 
-::-webkit-scrollbar-thumb:hover {
-  background: #334155;
+.glass-strong {
+  background: var(--surface-2);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border: 1px solid var(--border-2);
+  box-shadow: var(--shadow-card);
 }
+
+.fade-up { animation: qe-fade-up 0.3s var(--ease) both; }
