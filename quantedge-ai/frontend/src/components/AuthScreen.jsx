@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Sparkles, Zap, UserPlus, Shield, TrendingUp, BarChart2, Cpu, Github, LayoutGrid } from 'lucide-react';
+import { Sparkles, Zap, UserPlus, Shield, TrendingUp, BarChart2, Cpu, Github, Linkedin, LayoutGrid } from 'lucide-react';
 import { C, GRAD, TOKEN_KEY } from '../constants.js';
 import { Spinner } from './shared.jsx';
 import { apiAuthLogin, apiAuthRegister } from '../utils/api.js';
@@ -226,6 +226,24 @@ export function AuthScreen({ onLoggedIn }) {
               onMouseLeave={(e) => { e.currentTarget.style.color = C.muted; e.currentTarget.style.background = 'rgba(255,255,255,0.05)'; }}
             >
               <InstagramIcon size={14} />
+            </a>
+            {/* LinkedIn */}
+            <a
+              href="https://www.linkedin.com/in/swapnil-bobade"
+              target="_blank" rel="noopener noreferrer"
+              title="LinkedIn"
+              style={{
+                width: 30, height: 30, borderRadius: 8,
+                background: 'rgba(255,255,255,0.05)',
+                border: '1px solid rgba(255,255,255,0.08)',
+                display: 'grid', placeItems: 'center',
+                color: C.muted, textDecoration: 'none',
+                transition: 'all 0.15s ease',
+              }}
+              onMouseEnter={(e) => { e.currentTarget.style.color = '#0a66c2'; e.currentTarget.style.background = 'rgba(10,102,194,0.12)'; }}
+              onMouseLeave={(e) => { e.currentTarget.style.color = C.muted; e.currentTarget.style.background = 'rgba(255,255,255,0.05)'; }}
+            >
+              <Linkedin size={14} />
             </a>
           </div>
         </div>
