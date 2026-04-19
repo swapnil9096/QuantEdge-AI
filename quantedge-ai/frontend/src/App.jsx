@@ -88,9 +88,13 @@ export default function App() {
   }, []);
 
   // ---- WebSocket live prices (Phase 3) ------------------------------------
-  const { prices: livePrices, connected: wsConnected, subscribe, unsubscribe } = useWebSocket(
-    currentUser ? `${API_BASE.replace(/^http/, 'ws')}/ws/live-prices` : null,
-  );
+  // Only open a WebSocket when we have an absolute API base URL.
+  // If API_BASE is '' (same-origin / single-domain deploy), relative ws:// URLs
+  // are invalid and the WebSocket constructor would throw a DOMException.
+  const _wsUrl = currentUser && API_BASE
+    ? `${API_BASE.replace(/^http/, 'ws')}/ws/live-prices`
+    : null;
+  const { prices: livePrices, connected: wsConnected, subscribe, unsubscribe } = useWebSocket(_wsUrl);
 
   // Subscribe watchlist symbols whenever they change
   useEffect(() => {

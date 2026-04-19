@@ -53,6 +53,16 @@ from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSock
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+# PyJWT is a hard dependency (listed in requirements.txt). Import it at the
+# module level so _issue_user_token / _verify_user_token always have it,
+# independent of the optional vault-deps try block further below.
+try:
+    import jwt as _jwt
+    _JWT_OK = True
+except ImportError:
+    _jwt = None  # type: ignore
+    _JWT_OK = False
+
 load_dotenv()
 
 logging.basicConfig(
@@ -149,6 +159,8 @@ def _verify_password(plain: str, hashed: str) -> bool:
 
 
 def _issue_user_token(user_id: int, username: str, is_admin: bool = False) -> dict[str, Any]:
+    if not _JWT_OK:
+        raise HTTPException(status_code=500, detail="PyJWT not installed — cannot issue tokens.")
     now = int(time.time())
     payload = {
         "sub": user_id,
@@ -170,7 +182,7 @@ def _issue_user_token(user_id: int, username: str, is_admin: bool = False) -> di
 
 
 def _verify_user_token(authorization: Optional[str]) -> Optional[dict[str, Any]]:
-    if not authorization or not authorization.lower().startswith("bearer "):
+    if not _JWT_OK or not authorization or not authorization.lower().startswith("bearer "):
         return None
     token = authorization.split(" ", 1)[1].strip()
     try:
@@ -523,18 +535,25 @@ app = FastAPI(
     version="2.0.0",
 )
 
-# CORS — allow requests from the frontend origin.
-# Set FRONTEND_URL env var to your Vercel URL (e.g. https://quantedge.vercel.app).
-# Falls back to ["*"] in dev / single-domain deployments.
-_frontend_url = os.getenv("FRONTEND_URL", "").rstrip("/")
-_cors_origins = [_frontend_url] if _frontend_url else ["*"]
-
+# CORS — always allow all origins.
+#
+# Auth uses JWT Bearer tokens, NOT cookies, so allow_credentials=False is both
+# correct and required when allow_origins=["*"]. A wildcard origin is safe here
+# because there are no session cookies that CSRF could hijack; every request
+# must carry a signed JWT.  Restricting to a specific FRONTEND_URL would cause
+# Starlette to respond with "400 Disallowed CORS origin" on any mismatch —
+# e.g. preview branches, local dev, or a FRONTEND_URL env-var typo — which
+# breaks login silently and is impossible to debug from the frontend.
+#
+# FRONTEND_URL is still used as documentation in render.yaml and vercel.json
+# but is NOT consulted for CORS enforcement here.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_cors_origins,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
-    allow_credentials=bool(_frontend_url),
+    allow_credentials=False,
+    expose_headers=["*"],
 )
 
 
@@ -3247,7 +3266,8 @@ def _init_paper_schema() -> None:
                 combined_score INTEGER,
                 notes          TEXT,
                 last_price     REAL,
-                last_marked_at TEXT
+                last_marked_at TEXT,
+                user_id        INTEGER REFERENCES users(id)
             )
             """
         )
@@ -3328,7 +3348,8 @@ def _init_broker_schema() -> None:
                 status         TEXT,
                 placed_at      TEXT    NOT NULL,
                 updated_at     TEXT,
-                response       TEXT
+                response       TEXT,
+                user_id        INTEGER REFERENCES users(id)
             )
             """
         )
@@ -4422,7 +4443,7 @@ class ChangePasswordRequest(BaseModel):
 @app.post("/auth/register")
 async def auth_register(req: AuthRegisterRequest) -> dict[str, Any]:
     if not _BCRYPT_OK:
-        raise HTTPException(status_code=501, detail="passlib[bcrypt] not installed on server.")
+        raise HTTPException(status_code=501, detail="bcrypt not installed on server.")
     with _db_lock, _db_connect() as conn:
         existing = conn.execute(
             "SELECT id FROM users WHERE username=?", (req.username,)
@@ -4448,7 +4469,7 @@ async def auth_register(req: AuthRegisterRequest) -> dict[str, Any]:
 @app.post("/auth/login")
 async def auth_login(req: AuthLoginRequest) -> dict[str, Any]:
     if not _BCRYPT_OK:
-        raise HTTPException(status_code=501, detail="passlib[bcrypt] not installed on server.")
+        raise HTTPException(status_code=501, detail="bcrypt not installed on server.")
     with _db_lock, _db_connect() as conn:
         row = conn.execute(
             "SELECT id, password_hash, is_admin, is_active FROM users WHERE username=?",
@@ -5758,15 +5779,20 @@ async def ws_live_prices(websocket: WebSocket) -> None:
 # ---------------------------------------------------------------------------
 
 # SmartAPI optional imports (graceful degradation when not installed).
+# The module was renamed from 'SmartApi' → 'smartapi' in smartapi-python v1.4+;
+# try both so the code works across package versions.
 try:
-    from SmartApi import SmartConnect as _SmartConnect  # type: ignore
+    try:
+        from SmartApi import SmartConnect as _SmartConnect  # type: ignore  # ≤1.3.x
+    except ImportError:
+        from smartapi import SmartConnect as _SmartConnect  # type: ignore  # ≥1.4.x
     import pyotp as _pyotp  # type: ignore
     _SMARTAPI_OK = True
-except ImportError:
+except ImportError as _smartapi_err:
     _SmartConnect = None  # type: ignore
     _pyotp = None  # type: ignore
     _SMARTAPI_OK = False
-    logger.warning("smartapi-python / pyotp not installed. Broker features disabled.")
+    logger.warning("Broker features disabled: %s", _smartapi_err)
 
 # --------------- In-memory session state ---------------
 _broker_sessions: dict[int, dict] = {}   # user_id → session dict
