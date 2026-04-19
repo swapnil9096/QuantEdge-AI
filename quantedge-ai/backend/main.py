@@ -1425,17 +1425,36 @@ async def _fetch_alphavantage_overview(symbol: str) -> dict[str, Any]:
 
 
 def _fetch_yahoo_fundamentals_sync(yahoo_symbol: str) -> dict[str, Any]:
-    """Best-effort Yahoo Finance fundamentals via yfinance. Returns a dict of raw values."""
+    """Best-effort Yahoo Finance fundamentals via yfinance. Returns a dict of raw values.
+
+    Strategy:
+    1. ticker.fast_info  — lightweight, not rate-limited: market_cap, shares, last_price
+    2. ticker.info       — may be rate-limited; used for pe_ratio, book_value, sector
+    3. ticker.financials / balance_sheet — derive any still-missing metrics
+    """
     import yfinance as yf
 
     ticker = yf.Ticker(yahoo_symbol)
+
+    # ---- Step 1: fast_info (reliable even under rate limiting) ----------------
+    fast_market_cap: Optional[float] = None
+    fast_shares:     Optional[float] = None
+    fast_price:      Optional[float] = None
+    try:
+        fi = ticker.fast_info
+        fast_market_cap = _to_float(getattr(fi, "market_cap", None))
+        fast_shares     = _to_float(getattr(fi, "shares", None))
+        fast_price      = _to_float(getattr(fi, "last_price", None))
+    except Exception as exc:
+        logger.debug("yfinance fast_info failed for %s: %s", yahoo_symbol, exc)
+
+    # ---- Step 2: .info (best-effort; may be empty if rate-limited) -----------
     info: dict[str, Any] = {}
     try:
         info = ticker.info or {}
     except Exception as exc:
         logger.debug("yfinance info failed for %s: %s", yahoo_symbol, exc)
 
-    # yfinance field names vary by version — try multiple aliases.
     def _pick(*keys: str) -> Optional[float]:
         for k in keys:
             v = _to_float(info.get(k))
@@ -1443,17 +1462,17 @@ def _fetch_yahoo_fundamentals_sync(yahoo_symbol: str) -> dict[str, Any]:
                 return v
         return None
 
-    rev_growth   = _pick("revenueGrowth", "earningsQuarterlyGrowth", "revenueQuarterlyGrowth")
-    profit_growth = _pick("earningsGrowth", "netIncomeGrowth", "earningsQuarterlyGrowth")
-    debt_to_equity = _pick("debtToEquity", "totalDebt")
-    roe          = _pick("returnOnEquity", "returnOnAssets")
-    pe_ratio     = _pick("trailingPE", "forwardPE", "priceToEarningsTrailing")
-    book_value   = _pick("bookValue", "priceToBook")
-    market_cap   = _pick("marketCap", "enterpriseValue")
-    insider_pct  = _pick("heldPercentInsiders", "insidersPercentHeld")
-    inst_pct     = _pick("heldPercentInstitutions", "institutionsPercentHeld")
+    rev_growth    = _pick("revenueGrowth", "revenueQuarterlyGrowth")
+    profit_growth = _pick("earningsGrowth", "earningsQuarterlyGrowth")
+    debt_to_equity= _pick("debtToEquity")
+    roe           = _pick("returnOnEquity")
+    pe_ratio      = _pick("trailingPE", "forwardPE")
+    book_value    = _pick("bookValue")
+    market_cap    = _pick("marketCap") or fast_market_cap   # fast_info as fallback
+    insider_pct   = _pick("heldPercentInsiders")
+    inst_pct      = _pick("heldPercentInstitutions")
 
-    # yfinance returns *fractions* for growth/ROE (0.18 = 18%); normalise to percent.
+    # normalise fractions → percent
     if rev_growth is not None and -2 <= rev_growth <= 2:
         rev_growth *= 100
     if profit_growth is not None and -2 <= profit_growth <= 2:
@@ -1464,71 +1483,87 @@ def _fetch_yahoo_fundamentals_sync(yahoo_symbol: str) -> dict[str, Any]:
         insider_pct *= 100
     if inst_pct is not None and 0 <= inst_pct <= 1:
         inst_pct *= 100
-    # debtToEquity is often reported as 85.3 meaning 0.853; if > 10, divide.
     if debt_to_equity is not None and debt_to_equity > 10:
         debt_to_equity = debt_to_equity / 100
 
-    # Fallback: derive missing metrics from raw financials statements.
+    # ---- Step 3: derive from financial statements (most reliable fallback) ---
     try:
-        fin = ticker.financials
-        bs  = ticker.balance_sheet
+        fin = ticker.financials      # annual income statement
+        bs  = ticker.balance_sheet   # annual balance sheet
 
-        if fin is not None and bs is not None and not fin.empty and not bs.empty:
-            # ROE from financials if info didn't carry it.
-            if roe is None:
-                ni = _to_float(fin.loc["Net Income"].iloc[0]) if "Net Income" in fin.index else None
-                eq_row = next(
-                    (k for k in ("Stockholders Equity", "Total Stockholder Equity",
-                                 "Total Equity Gross Minority Interest") if k in bs.index),
-                    None,
-                )
-                equity = _to_float(bs.loc[eq_row].iloc[0]) if eq_row else None
-                if ni is not None and equity and equity > 0:
-                    roe = ni / equity * 100
+        has_fin = fin is not None and not fin.empty
+        has_bs  = bs  is not None and not bs.empty
 
-            # Revenue growth from two consecutive years if info missed it.
-            if rev_growth is None and "Total Revenue" in fin.index and fin.shape[1] >= 2:
-                r_new = _to_float(fin.loc["Total Revenue"].iloc[0])
-                r_old = _to_float(fin.loc["Total Revenue"].iloc[1])
-                if r_new is not None and r_old and r_old > 0:
-                    rev_growth = (r_new - r_old) / r_old * 100
+        # Helper: latest value for a row, trying multiple name aliases
+        def _bs_val(*row_names: str) -> Optional[float]:
+            if not has_bs:
+                return None
+            for rn in row_names:
+                if rn in bs.index:
+                    return _to_float(bs.loc[rn].iloc[0])
+            return None
 
-            # Profit growth from two consecutive years.
-            if profit_growth is None and "Net Income" in fin.index and fin.shape[1] >= 2:
-                n_new = _to_float(fin.loc["Net Income"].iloc[0])
-                n_old = _to_float(fin.loc["Net Income"].iloc[1])
-                if n_new is not None and n_old and n_old > 0:
-                    profit_growth = (n_new - n_old) / n_old * 100
+        def _fin_val(*row_names: str) -> Optional[float]:
+            if not has_fin:
+                return None
+            for rn in row_names:
+                if rn in fin.index:
+                    return _to_float(fin.loc[rn].iloc[0])
+            return None
 
-            # D/E from balance sheet.
-            if debt_to_equity is None:
-                debt_row = next(
-                    (k for k in ("Total Debt", "Long Term Debt", "Short Long Term Debt") if k in bs.index),
-                    None,
-                )
-                eq_row2 = next(
-                    (k for k in ("Stockholders Equity", "Total Stockholder Equity",
-                                 "Total Equity Gross Minority Interest") if k in bs.index),
-                    None,
-                )
-                debt_val = _to_float(bs.loc[debt_row].iloc[0]) if debt_row else None
-                eq_val   = _to_float(bs.loc[eq_row2].iloc[0]) if eq_row2 else None
-                if debt_val is not None and eq_val and eq_val > 0:
-                    debt_to_equity = debt_val / eq_val
+        equity = _bs_val(
+            "Stockholders Equity", "Total Stockholder Equity",
+            "Total Equity Gross Minority Interest", "Common Stock Equity",
+        )
+        net_income = _fin_val("Net Income", "Net Income Common Stockholders")
+        total_debt = _bs_val("Total Debt", "Long Term Debt", "Short Long Term Debt")
+        shares_out = (
+            fast_shares
+            or _to_float(info.get("sharesOutstanding") or info.get("impliedSharesOutstanding"))
+        )
+        price = fast_price or _to_float(
+            info.get("currentPrice") or info.get("regularMarketPrice")
+        )
 
-            # Market cap from price × shares if missing.
-            if market_cap is None:
-                shares = _to_float(info.get("sharesOutstanding") or info.get("impliedSharesOutstanding"))
-                price  = _to_float(info.get("currentPrice") or info.get("regularMarketPrice"))
-                if shares and price:
-                    market_cap = shares * price
+        # ROE
+        if roe is None and net_income and equity and equity > 0:
+            roe = net_income / equity * 100
 
-            # P/E from price / EPS if missing.
-            if pe_ratio is None:
-                eps = _to_float(info.get("trailingEps") or info.get("epsTrailingTwelveMonths"))
-                price = _to_float(info.get("currentPrice") or info.get("regularMarketPrice"))
-                if eps and eps > 0 and price:
-                    pe_ratio = price / eps
+        # Revenue growth (YoY from annual)
+        if rev_growth is None and has_fin and "Total Revenue" in fin.index and fin.shape[1] >= 2:
+            r_new = _to_float(fin.loc["Total Revenue"].iloc[0])
+            r_old = _to_float(fin.loc["Total Revenue"].iloc[1])
+            if r_new and r_old and r_old > 0:
+                rev_growth = (r_new - r_old) / r_old * 100
+
+        # Profit growth (YoY from annual)
+        if profit_growth is None and has_fin and "Net Income" in fin.index and fin.shape[1] >= 2:
+            n_new = _to_float(fin.loc["Net Income"].iloc[0])
+            n_old = _to_float(fin.loc["Net Income"].iloc[1])
+            if n_new and n_old and n_old > 0:
+                profit_growth = (n_new - n_old) / n_old * 100
+
+        # D/E from balance sheet
+        if debt_to_equity is None and total_debt is not None and equity and equity > 0:
+            debt_to_equity = total_debt / equity
+
+        # Market cap: fast_info first, then price × shares
+        if market_cap is None and price and shares_out:
+            market_cap = price * shares_out
+
+        # Book value per share from equity / shares
+        if book_value is None and equity and shares_out and shares_out > 0:
+            book_value = equity / shares_out
+
+        # P/E from price / (net_income / shares)
+        if pe_ratio is None:
+            # Try trailingEps from info first
+            eps = _to_float(info.get("trailingEps") or info.get("epsTrailingTwelveMonths"))
+            # Derive EPS from financials if missing
+            if eps is None and net_income and shares_out and shares_out > 0:
+                eps = net_income / shares_out
+            if eps and eps > 0 and price:
+                pe_ratio = price / eps
 
     except Exception as exc:
         logger.debug("Fundamentals financials fallback failed for %s: %s", yahoo_symbol, exc)
