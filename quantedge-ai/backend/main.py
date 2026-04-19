@@ -286,6 +286,7 @@ _API_PATH_PREFIXES: tuple[str, ...] = (
 
 # Paths that do NOT require a user JWT — open to all callers.
 _PUBLIC_PATHS: set[str] = {
+    "/",
     "/health",
     "/lock-status",
     "/unlock",
@@ -593,8 +594,15 @@ async def _auth_gate(request: Any, call_next):
         return await call_next(request)
 
     # Verify user JWT
-    user = _verify_user_token(request.headers.get("Authorization"))
+    auth_header = request.headers.get("Authorization")
+    user = _verify_user_token(auth_header)
     if not user:
+        logger.warning(
+            "AUTH REJECTED %s %s | header_present=%s | header_prefix=%s",
+            method, path,
+            bool(auth_header),
+            (auth_header or "")[:15] if auth_header else "NONE",
+        )
         return JSONResponse(
             status_code=401,
             content={
@@ -4363,6 +4371,12 @@ async def api_info() -> dict[str, Any]:
             },
         },
     }
+
+
+@app.get("/")
+@app.head("/")
+async def root() -> dict[str, Any]:
+    return {"service": "QuantEdge AI", "status": "ok"}
 
 
 @app.get("/health")
