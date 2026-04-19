@@ -506,12 +506,18 @@ app = FastAPI(
     version="2.0.0",
 )
 
+# CORS — allow requests from the frontend origin.
+# Set FRONTEND_URL env var to your Vercel URL (e.g. https://quantedge.vercel.app).
+# Falls back to ["*"] in dev / single-domain deployments.
+_frontend_url = os.getenv("FRONTEND_URL", "").rstrip("/")
+_cors_origins = [_frontend_url] if _frontend_url else ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
-    allow_credentials=False,
+    allow_credentials=bool(_frontend_url),
 )
 
 

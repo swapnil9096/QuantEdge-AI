@@ -1,0 +1,61 @@
+# render.yaml — QuantEdge AI backend on Render
+#
+# Deploy steps:
+#   1. Push this repo to GitHub
+#   2. Render dashboard → New → Blueprint → connect this repo
+#   3. Set the secret env vars listed below in Render dashboard
+#      (Environment → Add environment variable):
+#        SECRET_KEY      = <run: python3 -c "import secrets; print(secrets.token_hex(32))">
+#        ADMIN_PASSWORD  = <strong password for the default admin account>
+#        FRONTEND_URL    = https://<your-app>.vercel.app   ← your Vercel URL
+#        ANTHROPIC_API_KEY or PORTKEY_API_KEY (for AI features)
+#        TELEGRAM_BOT_TOKEN (for Telegram alerts)
+#
+# The frontend is deployed separately on Vercel.
+# Set VITE_API_BASE=https://<your-render-service>.onrender.com in Vercel env vars.
+
+services:
+  - type: web
+    name: quantedge-backend
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    autoDeploy: true
+
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: LOG_LEVEL
+        value: INFO
+      - key: PORT
+        value: "8000"
+      - key: SESSION_TTL_HOURS
+        value: "720"
+      - key: PAPER_CAPITAL
+        value: "1000000"
+      - key: PAPER_RISK_PCT
+        value: "2.0"
+      - key: PAPER_MAX_OPEN
+        value: "5"
+      - key: PAPER_MAX_HOLD_DAYS
+        value: "20"
+      - key: PAPER_MONITOR_INTERVAL
+        value: "60"
+      - key: AUTO_PAPER_TRADE_ENABLED
+        value: "true"
+      - key: AUTO_PAPER_TRADE_THRESHOLD
+        value: "70"
+      - key: AUTO_TRADE_MARKET_OPEN_ONLY
+        value: "false"
+      - key: BROKER_ENABLED
+        value: "false"
+
+      # ── Secrets: set these in Render dashboard, NOT here ──────────────────
+      # SECRET_KEY        (required — signs all user JWTs)
+      # ADMIN_PASSWORD    (required — default admin account password)
+      # FRONTEND_URL      (required — your Vercel URL for CORS)
+      # ANTHROPIC_API_KEY / PORTKEY_API_KEY
+      # TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
+      # MASTER_PASSWORD   (optional — auto-unlocks encrypted vault)

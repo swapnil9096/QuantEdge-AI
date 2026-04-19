@@ -33,17 +33,25 @@ export const GRAD = {
 
 export const FONT_MONO = "'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace";
 
-// API base URL. In dev (Vite on :3000) we hit the backend on :8000 directly.
+// API base URL resolution:
+//   1. VITE_API_BASE env var → always wins (set this on Vercel to your Render URL)
+//   2. Local dev on :3000   → http://localhost:8000
+//   3. Single-domain deploy (Fly / Koyeb — backend serves frontend) → '' (same origin)
+//
+// For Render + Vercel: set VITE_API_BASE=https://<your-service>.onrender.com
+// in Vercel's project settings → Environment Variables.
 export const API_BASE = (() => {
   const envOverride = import.meta.env.VITE_API_BASE;
   if (envOverride) return envOverride.replace(/\/$/, '');
   if (typeof window !== 'undefined') {
     const { hostname, port } = window.location;
-    const sameOrigin = hostname !== 'localhost' && hostname !== '127.0.0.1';
-    if (sameOrigin) return '';
-    if (port === '3000') return 'http://localhost:8000';
+    if (hostname === 'localhost' || hostname === '127.0.0.1') {
+      return port === '3000' ? 'http://localhost:8000' : '';
+    }
+    // Non-localhost without VITE_API_BASE = single-domain deploy (same origin)
+    return '';
   }
-  return 'http://localhost:8000';
+  return '';
 })();
 
 export const TOKEN_KEY = 'quantedge_session_token';
