@@ -123,8 +123,24 @@ BROKER_ENABLED: bool = os.getenv("BROKER_ENABLED", "false").strip().lower() in (
 # If not set we generate a random one — tokens will be invalidated on restart.
 SECRET_KEY: str = os.getenv("SECRET_KEY", "")
 if not SECRET_KEY:
-    SECRET_KEY = _secrets_mod.token_hex(32) if "_secrets_mod" in dir() else os.urandom(32).hex()
-    logger.warning("SECRET_KEY not set — using random key; all user sessions will be lost on server restart.")
+    # Derive a stable key from ADMIN_PASSWORD so tokens survive Render restarts.
+    # IMPORTANT: set SECRET_KEY in Render dashboard for maximum security.
+    _admin_pw = os.getenv("ADMIN_PASSWORD", "")
+    if _admin_pw:
+        import hashlib as _hashlib
+        SECRET_KEY = _hashlib.sha256(f"quantedge-jwt-signing-key:{_admin_pw}".encode()).hexdigest()
+        logger.info(
+            "SECRET_KEY not set — derived from ADMIN_PASSWORD. "
+            "Sessions will survive restarts unless ADMIN_PASSWORD changes. "
+            "Set SECRET_KEY explicitly for production security."
+        )
+    else:
+        SECRET_KEY = _secrets_mod.token_hex(32) if "_secrets_mod" in dir() else os.urandom(32).hex()
+        logger.warning(
+            "SECRET_KEY and ADMIN_PASSWORD not set — using random key. "
+            "All user sessions WILL be lost on every server restart. "
+            "Set SECRET_KEY in Render dashboard."
+        )
 
 USER_JWT_TTL_SECONDS = int(os.getenv("USER_JWT_TTL_HOURS", "720")) * 3600  # 30 days default
 
