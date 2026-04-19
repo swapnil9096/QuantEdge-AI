@@ -25,7 +25,7 @@ export const FONT_MONO = "'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo,
 // In production the backend serves the built frontend on the same origin so
 // relative URLs are correct.
 export const API_BASE = (() => {
-  const envOverride = import.meta?.env?.VITE_API_BASE;
+  const envOverride = import.meta.env.VITE_API_BASE;
   if (envOverride) return envOverride.replace(/\/$/, '');
   if (typeof window !== 'undefined') {
     const { hostname, port } = window.location;
