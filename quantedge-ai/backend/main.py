@@ -179,7 +179,7 @@ def _issue_user_token(user_id: int, username: str, is_admin: bool = False) -> di
         raise HTTPException(status_code=500, detail="PyJWT not installed — cannot issue tokens.")
     now = int(time.time())
     payload = {
-        "sub": user_id,
+        "sub": str(user_id),   # JWT spec + PyJWT 2.12+ require sub to be a string
         "username": username,
         "is_admin": is_admin,
         "iat": now,
