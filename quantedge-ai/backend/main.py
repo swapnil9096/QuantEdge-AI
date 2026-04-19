@@ -988,8 +988,10 @@ async def generate_gpt_analysis(context: dict[str, Any]) -> str:
 
         system_prompt = (
             "You are a senior quantitative trader at a long/short equity desk. "
-            "Write a crisp, actionable 3-4 sentence trade thesis for the given setup. "
-            "Reference the pattern, EMA structure, volume, and risk/reward. "
+            "Write a crisp, honest 3-4 sentence trade thesis based ONLY on the actual data provided. "
+            "If gates have failed (e.g. EMA not stacked, volume low, resistance nearby), "
+            "acknowledge those weaknesses explicitly — do NOT fabricate bullish conditions that aren't present. "
+            "Reference the pattern, actual EMA structure, volume ratio, and R/R. "
             "No disclaimers. No bullet points."
         )
         payload = {
@@ -1020,25 +1022,75 @@ async def generate_gpt_analysis(context: dict[str, Any]) -> str:
 
 
 def _format_context(ctx: dict[str, Any]) -> str:
+    failures = ctx.get("failures", [])
+    failures_str = ", ".join(failures) if failures else "none"
+    ema_stacked = ctx["ema20"] > ctx["ema50"] > ctx["ema200"]
+    resistance_clear = "no_resistance_within_3pct" not in failures
     return (
         f"Symbol: {ctx['symbol']}  Sector: {ctx['sector']}\n"
         f"Price: {ctx['price']:.2f}  Entry: {ctx['entry']:.2f}  Stop: {ctx['stop']:.2f}  "
         f"Target: {ctx['target']:.2f}  R/R: {ctx['rr']:.2f}  Expected return: {ctx['ret']:.2f}%\n"
         f"Pattern: {ctx['pattern']}  RSI: {ctx['rsi']:.1f}  Volume ratio: {ctx['vr']:.2f}x\n"
-        f"EMA 20/50/200: {ctx['ema20']:.2f} / {ctx['ema50']:.2f} / {ctx['ema200']:.2f}\n"
+        f"EMA 20/50/200: {ctx['ema20']:.2f} / {ctx['ema50']:.2f} / {ctx['ema200']:.2f}  "
+        f"EMA stacked (bullish): {ema_stacked}\n"
         f"MACD hist: {ctx['macd_hist']:+.3f}  Break of structure: {ctx['bos']}  "
+        f"Resistance clear (>3%): {resistance_clear}  "
         f"Liquidity grab: {ctx['lg']}  Institutional acc: {ctx['vol_acc']}\n"
+        f"Combined score: {ctx.get('combined_score', 'N/A')}/100  "
+        f"Gates failed: {failures_str}\n"
         f"Score breakdown: {ctx['breakdown']}"
     )
 
 
 def _heuristic_narrative(ctx: dict[str, Any]) -> str:
+    """Honest heuristic narrative that reflects actual gate results."""
+    failures = ctx.get("failures", [])
+    combined_score = ctx.get("combined_score", 0)
+    ema_stacked = ctx["ema20"] > ctx["ema50"] > ctx["ema200"]
+    resistance_clear = "no_resistance_within_3pct" not in failures
+    volume_ok = "volume_not_elevated" not in failures
+
+    # EMA structure sentence
+    if ema_stacked:
+        ema_str = f"EMAs are bullishly stacked (20 > 50 > 200) confirming the uptrend"
+    else:
+        ema_str = (
+            f"EMAs are not fully stacked (20: {ctx['ema20']:.0f} / 50: {ctx['ema50']:.0f} / "
+            f"200: {ctx['ema200']:.0f}), signalling a mixed trend structure"
+        )
+
+    # Volume sentence
+    vol_str = (
+        f"{ctx['vr']:.1f}x average volume confirms institutional participation"
+        if volume_ok
+        else f"volume at {ctx['vr']:.1f}x average is below the 1.5x threshold, limiting conviction"
+    )
+
+    # Resistance sentence
+    res_str = (
+        "with no major resistance within 3% above entry"
+        if resistance_clear
+        else "though strong resistance sits within 3% of entry, capping near-term upside"
+    )
+
+    # Conviction sentence
+    if combined_score >= 80:
+        conviction = f"R/R of {ctx['rr']:.2f} on a score of {combined_score}/100 makes this a high-conviction setup."
+    elif combined_score >= 60:
+        conviction = (
+            f"R/R of {ctx['rr']:.2f} is acceptable but the score of {combined_score}/100 "
+            f"suggests waiting for {', '.join(failures[:2]) if failures else 'confirmation'} to improve."
+        )
+    else:
+        conviction = (
+            f"With a score of {combined_score}/100 and failures in "
+            f"{', '.join(failures[:3]) if failures else 'multiple gates'}, "
+            f"this setup lacks sufficient conviction — pass or reduce size significantly."
+        )
+
     return (
-        f"{ctx['symbol']} is printing a {ctx['pattern']} above an aligned 20/50/200 EMA stack "
-        f"with RSI {ctx['rsi']:.1f} and a {ctx['vr']:.1f}x volume confirmation. "
-        f"A break of structure with no supply within 3% keeps the path of least resistance higher. "
-        f"Risk/reward of {ctx['rr']:.2f} on an entry near {ctx['entry']:.2f} makes this the highest-"
-        f"conviction setup in the NIFTY 500 today."
+        f"{ctx['symbol']} is showing a {ctx['pattern']} with RSI {ctx['rsi']:.1f}, {ema_str}. "
+        f"The {vol_str}, {res_str}. {conviction}"
     )
 
 
@@ -1135,6 +1187,8 @@ async def _run_alpha_scan() -> ScanResponse:
         "lg": best["smart"]["liquidity_grab"],
         "vol_acc": best["smart"]["volume_accumulation"],
         "breakdown": best["scores"],
+        "failures": best.get("failures", []),
+        "combined_score": int(best["scores"]["total"]),
     }
     analysis = await generate_gpt_analysis(gpt_context)
 
@@ -1831,6 +1885,13 @@ async def deep_analyze(symbol: str, exchange: str = "NSE") -> dict[str, Any]:
     high_probability = all_passed and combined_score >= COMBINED_MIN_SCORE
 
     # AI narrative
+    # Collect all gate failures for honest narrative
+    all_failures = (
+        technical_gate.get("failures", [])
+        + [c["name"] for c in fundamentals_gate.get("checks", []) if not c["passed"]]
+        + [c["name"] for c in backtest_gate.get("checks", []) if not c["passed"]]
+        + [c["name"] for c in risk_reward_gate.get("checks", []) if not c["passed"]]
+    )
     gpt_ctx = {
         "symbol": symbol.upper(),
         "sector": fund_snap.sector or SECTOR_MAP.get(symbol.upper(), "Diversified"),
@@ -1851,6 +1912,8 @@ async def deep_analyze(symbol: str, exchange: str = "NSE") -> dict[str, Any]:
         "lg": smart["liquidity_grab"],
         "vol_acc": smart["volume_accumulation"],
         "breakdown": tech_scores,
+        "failures": all_failures,
+        "combined_score": combined_score,
     }
     try:
         ai_text = await generate_gpt_analysis(gpt_ctx)
