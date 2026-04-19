@@ -16,19 +16,27 @@ export function installFetchInterceptor({ onLocked }) {
     const isBackend =
       (API_BASE && url.startsWith(API_BASE)) ||
       (!API_BASE && (url.startsWith('/') || (!url.startsWith('http') && !url.startsWith('//'))));
-    if (isBackend) {
-      const token = localStorage.getItem(TOKEN_KEY);
-      if (token) {
-        init = { ...init };
-        init.headers = { ...(init.headers || {}), Authorization: `Bearer ${token}` };
-      }
+
+    // Snapshot the token BEFORE the request is sent.
+    // This is the key to avoiding the stale-401 race condition:
+    // if the user logs in while a pre-login request is in-flight, the 401
+    // response arrives AFTER the new token is stored.  By comparing the
+    // token we sent with the one currently in storage, we can tell whether
+    // a new login happened and skip the logout in that case.
+    const tokenAtRequestTime = isBackend ? localStorage.getItem(TOKEN_KEY) : null;
+
+    if (isBackend && tokenAtRequestTime) {
+      init = { ...init };
+      init.headers = { ...(init.headers || {}), Authorization: `Bearer ${tokenAtRequestTime}` };
     }
+
     let res;
     try {
       res = await orig(input, init);
     } catch (err) {
       throw err;
     }
+
     if (isBackend && res.status === 401) {
       try {
         const clone = res.clone();
@@ -36,11 +44,17 @@ export function installFetchInterceptor({ onLocked }) {
         const code =
           (body && body.code) ||
           (body && body.detail && body.detail.code);
-        // Both old 'locked' code and new 'unauthorized' code trigger logout
         if (code === 'locked' || code === 'unauthorized') {
-          localStorage.removeItem(TOKEN_KEY);
-          localStorage.removeItem('quantedge_user');
-          onLocked?.();
+          // Only log out if the token hasn't changed since this request was
+          // made.  If the user logged in while this request was in-flight,
+          // tokenAtRequestTime differs from the current token — that means
+          // this 401 is stale and we must NOT clear the fresh session.
+          const currentToken = localStorage.getItem(TOKEN_KEY);
+          if (tokenAtRequestTime && currentToken === tokenAtRequestTime) {
+            localStorage.removeItem(TOKEN_KEY);
+            localStorage.removeItem('quantedge_user');
+            onLocked?.();
+          }
         }
       } catch {
         // ignore non-JSON 401s
