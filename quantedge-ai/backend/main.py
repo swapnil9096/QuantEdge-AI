@@ -975,37 +975,47 @@ def hard_conditions(
 
 
 # ---------------------------------------------------------------------------
-# GPT narrative
+# Claude narrative (replaces GPT-4o)
 # ---------------------------------------------------------------------------
 
 
 async def generate_gpt_analysis(context: dict[str, Any]) -> str:
-    if not OPENAI_API_KEY:
+    """Generate trade narrative using Claude API (falls back to heuristic)."""
+    if not ANTHROPIC_API_KEY:
         return _heuristic_narrative(context)
     try:
-        from openai import AsyncOpenAI
+        import httpx
 
-        client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-        response = await client.chat.completions.create(
-            model="gpt-4o",
-            temperature=0.2,
-            max_tokens=280,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a senior quantitative trader at a long/short equity desk. "
-                        "Write a crisp, actionable 3-4 sentence trade thesis for the given setup. "
-                        "Reference the pattern, EMA structure, volume, and risk/reward. "
-                        "No disclaimers. No bullet points."
-                    ),
-                },
-                {"role": "user", "content": _format_context(context)},
-            ],
+        system_prompt = (
+            "You are a senior quantitative trader at a long/short equity desk. "
+            "Write a crisp, actionable 3-4 sentence trade thesis for the given setup. "
+            "Reference the pattern, EMA structure, volume, and risk/reward. "
+            "No disclaimers. No bullet points."
         )
-        return (response.choices[0].message.content or "").strip() or _heuristic_narrative(context)
+        payload = {
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 280,
+            "temperature": 0.2,
+            "system": system_prompt,
+            "messages": [{"role": "user", "content": _format_context(context)}],
+        }
+        headers = {
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                json=payload,
+                headers=headers,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            text = (data.get("content") or [{}])[0].get("text", "").strip()
+            return text or _heuristic_narrative(context)
     except Exception as exc:
-        logger.warning("GPT-4o narrative failed: %s", exc)
+        logger.warning("Claude narrative failed: %s", exc)
         return _heuristic_narrative(context)
 
 
