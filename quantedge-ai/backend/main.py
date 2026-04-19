@@ -3205,9 +3205,13 @@ def _init_user_schema() -> None:
         admin = conn.execute("SELECT id FROM users WHERE is_admin=1 ORDER BY id LIMIT 1").fetchone()
         if admin:
             admin_id = admin["id"]
-            conn.execute(
-                "UPDATE paper_trades SET user_id=? WHERE user_id IS NULL", (admin_id,)
-            )
+            # Only backfill paper_trades if the table already exists (upgrade path).
+            # On a fresh DB it doesn't exist yet — _init_paper_schema() creates it next.
+            pt_cols = {row[1] for row in conn.execute("PRAGMA table_info(paper_trades)")}
+            if pt_cols:
+                conn.execute(
+                    "UPDATE paper_trades SET user_id=? WHERE user_id IS NULL", (admin_id,)
+                )
             # Ensure admin has a paper settings row
             conn.execute(
                 "INSERT OR IGNORE INTO user_paper_settings (user_id) VALUES (?)", (admin_id,)
