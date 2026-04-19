@@ -13,6 +13,7 @@ import { InsightsTab } from './components/InsightsTab.jsx';
 import { AlphaScanTab } from './components/AlphaScanTab.jsx';
 import { BrokerPanel } from './components/BrokerPanel.jsx';
 import { AuthScreen } from './components/AuthScreen.jsx';
+import { WelcomeModal } from './components/WelcomeModal.jsx';
 import { useWebSocket } from './hooks/useWebSocket.js';
 import {
   installFetchInterceptor, apiAuthMe,
@@ -73,6 +74,7 @@ export default function App() {
   // We validate the stored token with /auth/me before showing the app so the
   // main UI (and its child components) never mounts with a stale/invalid token.
   const [currentUser, setCurrentUser] = useState(null);
+  const [showWelcome, setShowWelcome] = useState(false);
 
   // sessionChecking=true only when there are stored credentials to verify.
   // While true we render a loading spinner instead of the main UI, which means
@@ -128,6 +130,11 @@ export default function App() {
 
   const handleLoggedIn = useCallback((res) => {
     setCurrentUser({ user_id: res.user_id, username: res.username, is_admin: res.is_admin });
+    const key = `qe_welcomed_${res.user_id}`;
+    if (!sessionStorage.getItem(key)) {
+      sessionStorage.setItem(key, '1');
+      setShowWelcome(true);
+    }
   }, []);
 
   // ---- WebSocket live prices (Phase 3) ------------------------------------
@@ -356,6 +363,13 @@ export default function App() {
         )}
         {activeTab === 'broker' && <BrokerPanel />}
       </main>
+
+      {showWelcome && (
+        <WelcomeModal
+          username={currentUser.username}
+          onClose={() => setShowWelcome(false)}
+        />
+      )}
     </div>
   );
 }

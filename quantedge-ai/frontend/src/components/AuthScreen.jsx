@@ -1,8 +1,20 @@
 import React, { useState } from 'react';
-import { Sparkles, Zap, UserPlus, Shield, TrendingUp, BarChart2, Cpu } from 'lucide-react';
+import { Sparkles, Zap, UserPlus, Shield, TrendingUp, BarChart2, Cpu, Github, LayoutGrid } from 'lucide-react';
 import { C, GRAD, TOKEN_KEY } from '../constants.js';
 import { Spinner } from './shared.jsx';
 import { apiAuthLogin, apiAuthRegister } from '../utils/api.js';
+import { FeatureModal } from './FeatureModal.jsx';
+
+// SVG icon for Instagram (not in lucide-react)
+function InstagramIcon({ size = 16 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+      <rect x="2" y="2" width="20" height="20" rx="5" ry="5" />
+      <circle cx="12" cy="12" r="4" />
+      <circle cx="17.5" cy="6.5" r="0.5" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
 
 const FEATURES = [
   { icon: <TrendingUp size={15} />, text: 'Real-time NSE scanner with live prices' },
@@ -18,6 +30,8 @@ export function AuthScreen({ onLoggedIn }) {
   const [confirmPwd, setConfirmPwd] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  // "View Key Features" modal state
+  const [showFeatures, setShowFeatures] = useState(false);
 
   const reset = () => { setError(null); setPassword(''); setConfirmPwd(''); };
   const switchTab = (t) => { setTab(t); reset(); };
@@ -138,7 +152,87 @@ export function AuthScreen({ onLoggedIn }) {
             </div>
           ))}
         </div>
+
+        {/* "View Key Features" button */}
+        <div style={{ marginTop: 22, position: 'relative' }}>
+          <button
+            onClick={() => setShowFeatures(true)}
+            style={{
+              display: 'inline-flex', alignItems: 'center', gap: 7,
+              padding: '0.5rem 1rem',
+              background: 'rgba(0,212,168,0.07)',
+              border: '1px solid rgba(0,212,168,0.25)',
+              borderRadius: 10, color: C.teal,
+              fontSize: 13, fontWeight: 600, cursor: 'pointer',
+              transition: 'all 0.18s ease',
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.background = 'rgba(0,212,168,0.13)';
+              e.currentTarget.style.boxShadow = '0 0 16px rgba(0,212,168,0.2)';
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.background = 'rgba(0,212,168,0.07)';
+              e.currentTarget.style.boxShadow = 'none';
+            }}
+          >
+            <LayoutGrid size={14} />
+            View All Features
+          </button>
+        </div>
+
+        {/* Footer: tagline + social links */}
+        <div style={{
+          marginTop: 'auto', paddingTop: 32, position: 'relative',
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          flexWrap: 'wrap', gap: 10,
+        }}>
+          <span style={{ fontSize: 12, color: C.muted }}>
+            Developed by{' '}
+            <span style={{ color: C.sub, fontWeight: 600 }}>Swapnil</span>
+          </span>
+          <div style={{ display: 'flex', gap: 8 }}>
+            {/* GitHub */}
+            <a
+              href="https://github.com/swapnil9096"
+              target="_blank" rel="noopener noreferrer"
+              title="GitHub"
+              style={{
+                width: 30, height: 30, borderRadius: 8,
+                background: 'rgba(255,255,255,0.05)',
+                border: '1px solid rgba(255,255,255,0.08)',
+                display: 'grid', placeItems: 'center',
+                color: C.muted, textDecoration: 'none',
+                transition: 'all 0.15s ease',
+              }}
+              onMouseEnter={(e) => { e.currentTarget.style.color = C.text; e.currentTarget.style.background = 'rgba(255,255,255,0.1)'; }}
+              onMouseLeave={(e) => { e.currentTarget.style.color = C.muted; e.currentTarget.style.background = 'rgba(255,255,255,0.05)'; }}
+            >
+              <Github size={14} />
+            </a>
+            {/* Instagram */}
+            <a
+              href="https://www.instagram.com/swapnill__77?igsh=MWt4NzlqaXhuOGV0NA%3D%3D&utm_source=qr"
+              target="_blank" rel="noopener noreferrer"
+              title="Instagram"
+              style={{
+                width: 30, height: 30, borderRadius: 8,
+                background: 'rgba(255,255,255,0.05)',
+                border: '1px solid rgba(255,255,255,0.08)',
+                display: 'grid', placeItems: 'center',
+                color: C.muted, textDecoration: 'none',
+                transition: 'all 0.15s ease',
+              }}
+              onMouseEnter={(e) => { e.currentTarget.style.color = '#e1306c'; e.currentTarget.style.background = 'rgba(225,48,108,0.1)'; }}
+              onMouseLeave={(e) => { e.currentTarget.style.color = C.muted; e.currentTarget.style.background = 'rgba(255,255,255,0.05)'; }}
+            >
+              <InstagramIcon size={14} />
+            </a>
+          </div>
+        </div>
       </div>
+
+      {/* Feature modal — rendered at root level of AuthScreen */}
+      {showFeatures && <FeatureModal onClose={() => setShowFeatures(false)} />}
 
       {/* ── Right panel — form ───────────────────────────────────────── */}
       <div className="qe-auth-form-col" style={{
