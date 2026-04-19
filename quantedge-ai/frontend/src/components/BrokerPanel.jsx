@@ -198,7 +198,9 @@ export function BrokerPanel() {
               marginBottom: 12,
             }}
           >
-            <b>Angel One API keys not configured.</b> Add them via the secrets vault:
+            <b>Angel One API keys not configured.</b>
+            {' '}Set these environment variables in your hosting dashboard (Render / Koyeb) or in{' '}
+            <code style={{ fontFamily: FONT_MONO }}>backend/.env</code>:
             <pre
               style={{
                 background: C.dark,
@@ -211,7 +213,13 @@ export function BrokerPanel() {
                 color: C.sub,
                 overflowX: 'auto',
               }}
-            >{`python scripts/setup_secrets.py \\
+            >{`ANGEL_CLIENT_ID=<your_client_id>
+ANGEL_PASSWORD=<your_password>
+ANGEL_TOTP_SECRET=<base32_totp_secret>
+ANGEL_API_KEY=<your_api_key>
+
+# Or use the vault script (local dev):
+python scripts/setup_secrets.py \\
   --add-secret ANGEL_CLIENT_ID=<your_id> \\
   --add-secret ANGEL_PASSWORD=<your_pwd> \\
   --add-secret ANGEL_TOTP_SECRET=<totp_key> \\

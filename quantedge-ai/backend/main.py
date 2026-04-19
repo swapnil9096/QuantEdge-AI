@@ -293,25 +293,35 @@ vault = SecretsVault()
 def _reload_secret_globals(d: dict[str, str]) -> None:
     """Push the decrypted (or empty) secrets into module globals so existing
     call sites (e.g. `_build_claude_route`) pick up the values with no
-    refactor. Called from vault.unlock() and vault.lock()."""
+    refactor. Called from vault.unlock() and vault.lock().
+
+    Vault values take priority; env vars are kept as fallback so that secrets
+    set in the hosting dashboard (Render, Koyeb, fly.io) continue to work even
+    when the vault file does not contain a particular key.
+    """
     global TWELVEDATA_API_KEY, ALPHA_VANTAGE_API_KEY, POLYGON_API_KEY
     global OPENAI_API_KEY, ANTHROPIC_API_KEY
     global PORTKEY_API_KEY, PORTKEY_VIRTUAL_KEY, PORTKEY_CONFIG
     global TELEGRAM_BOT_TOKEN
     global ANGEL_CLIENT_ID, ANGEL_PASSWORD, ANGEL_TOTP_SECRET, ANGEL_API_KEY
-    TWELVEDATA_API_KEY = d.get("TWELVEDATA_API_KEY", "")
-    ALPHA_VANTAGE_API_KEY = d.get("ALPHA_VANTAGE_API_KEY", "")
-    POLYGON_API_KEY = d.get("POLYGON_API_KEY", "")
-    OPENAI_API_KEY = d.get("OPENAI_API_KEY", "")
-    ANTHROPIC_API_KEY = d.get("ANTHROPIC_API_KEY", "")
-    PORTKEY_API_KEY = d.get("PORTKEY_API_KEY", "")
-    PORTKEY_VIRTUAL_KEY = d.get("PORTKEY_VIRTUAL_KEY", "")
-    PORTKEY_CONFIG = d.get("PORTKEY_CONFIG", "")
-    TELEGRAM_BOT_TOKEN = d.get("TELEGRAM_BOT_TOKEN", "")
-    ANGEL_CLIENT_ID = d.get("ANGEL_CLIENT_ID", "")
-    ANGEL_PASSWORD = d.get("ANGEL_PASSWORD", "")
-    ANGEL_TOTP_SECRET = d.get("ANGEL_TOTP_SECRET", "")
-    ANGEL_API_KEY = d.get("ANGEL_API_KEY", "")
+
+    def _val(key: str) -> str:
+        # Vault value wins; fall back to the env var set at startup.
+        return d.get(key) or os.getenv(key, "")
+
+    TWELVEDATA_API_KEY = _val("TWELVEDATA_API_KEY")
+    ALPHA_VANTAGE_API_KEY = _val("ALPHA_VANTAGE_API_KEY")
+    POLYGON_API_KEY = _val("POLYGON_API_KEY")
+    OPENAI_API_KEY = _val("OPENAI_API_KEY")
+    ANTHROPIC_API_KEY = _val("ANTHROPIC_API_KEY")
+    PORTKEY_API_KEY = _val("PORTKEY_API_KEY")
+    PORTKEY_VIRTUAL_KEY = _val("PORTKEY_VIRTUAL_KEY")
+    PORTKEY_CONFIG = _val("PORTKEY_CONFIG")
+    TELEGRAM_BOT_TOKEN = _val("TELEGRAM_BOT_TOKEN")
+    ANGEL_CLIENT_ID = _val("ANGEL_CLIENT_ID")
+    ANGEL_PASSWORD = _val("ANGEL_PASSWORD")
+    ANGEL_TOTP_SECRET = _val("ANGEL_TOTP_SECRET")
+    ANGEL_API_KEY = _val("ANGEL_API_KEY")
 
 
 def _issue_session_token() -> dict[str, Any]:
@@ -5341,7 +5351,17 @@ async def broker_connect():
     if not _SMARTAPI_OK:
         raise HTTPException(status_code=501, detail="smartapi-python not installed. Run: pip install smartapi-python pyotp")
     if not _broker_keys_configured():
-        raise HTTPException(status_code=400, detail="Angel One credentials not configured. Add them to the vault.")
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Angel One API keys not configured. "
+                "Add them as environment variables in your hosting dashboard "
+                "(ANGEL_CLIENT_ID, ANGEL_PASSWORD, ANGEL_TOTP_SECRET, ANGEL_API_KEY), "
+                "or run: python scripts/setup_secrets.py --add-secret ANGEL_CLIENT_ID=... "
+                "--add-secret ANGEL_PASSWORD=... --add-secret ANGEL_TOTP_SECRET=... "
+                "--add-secret ANGEL_API_KEY=..."
+            ),
+        )
     try:
         obj = _SmartConnect(api_key=ANGEL_API_KEY)
         totp_val = _pyotp.TOTP(ANGEL_TOTP_SECRET).now()
