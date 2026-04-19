@@ -1584,90 +1584,134 @@ def _fetch_yahoo_fundamentals_sync(yahoo_symbol: str) -> dict[str, Any]:
     }
 
 
-# NSE cookie jar / session reused across calls within a process.
+# NSE headers — rotated UA list reduces chance of block on server IPs
+_NSE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/123.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer": "https://www.nseindia.com/",
+    "Origin": "https://www.nseindia.com",
+    "Connection": "keep-alive",
+    "sec-ch-ua": '"Google Chrome";v="123", "Not:A-Brand";v="8"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+}
+
 _nse_client_lock = asyncio.Lock()
-_nse_cookies_ready = False
-
-
-async def _prime_nse_cookies(client: httpx.AsyncClient) -> None:
-    """NSE requires a warm cookie from the homepage before /api/* calls work."""
-    global _nse_cookies_ready
-    if _nse_cookies_ready:
-        return
-    try:
-        await client.get("https://www.nseindia.com/", timeout=5)
-        await client.get(
-            "https://www.nseindia.com/market-data/live-equity-market", timeout=5
-        )
-        _nse_cookies_ready = True
-    except Exception as exc:
-        logger.debug("NSE cookie warm-up failed: %s", exc)
 
 
 async def _fetch_nse_shareholding(symbol: str) -> dict[str, Optional[float]]:
     """Pull shareholding pattern (promoter / FII / DII / pledge) from NSE.
-    Best-effort — returns all-None if the network / corp-proxy blocks it.
+
+    Tries two endpoints in order:
+    1. /api/corporate-shareholding-pattern  — dedicated shareholding endpoint
+    2. /api/quote-equity                    — quote page (has summaryInfo)
+    Best-effort — returns all-None if NSE blocks the server IP.
     """
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.nseindia.com/",
-    }
     result: dict[str, Optional[float]] = {
         "promoter_holding": None,
         "fii_holding": None,
         "dii_holding": None,
         "promoter_pledge": None,
     }
+    sym = symbol.upper()
+
     async with _nse_client_lock:
-        async with httpx.AsyncClient(
-            headers=headers, timeout=6, follow_redirects=True
-        ) as client:
-            await _prime_nse_cookies(client)
-            try:
-                r = await client.get(
-                    "https://www.nseindia.com/api/quote-equity",
-                    params={"symbol": symbol.upper()},
+        try:
+            async with httpx.AsyncClient(
+                headers=_NSE_HEADERS,
+                timeout=10,
+                follow_redirects=True,
+            ) as client:
+                # Warm up session with two page visits (NSE requires cookies)
+                await client.get("https://www.nseindia.com/", timeout=6)
+                await client.get(
+                    "https://www.nseindia.com/get-quotes/equity?symbol=" + sym,
                     timeout=6,
                 )
-                if r.status_code != 200:
-                    return result
-                payload = r.json()
-            except Exception as exc:
-                logger.debug("NSE quote-equity failed for %s: %s", symbol, exc)
-                return result
 
-    # Shareholding fields — NSE schema varies; be defensive.
-    sh = payload.get("securityInfo", {}) or {}
-    holdings = payload.get("shareholdingPattern", {}) or {}
+                # ---- Endpoint 1: dedicated shareholding pattern ----------------
+                r1 = await client.get(
+                    "https://www.nseindia.com/api/corporate-shareholding-pattern",
+                    params={"symbol": sym, "series": "EQ", "from": "", "to": "",
+                            "industryID": "", "periodicity": "Quarterly"},
+                    timeout=8,
+                )
+                if r1.status_code == 200:
+                    data1 = r1.json()
+                    rows = data1.get("data") or []
+                    promoter = fii = dii = pledge = None
+                    for row in rows:
+                        cat = (row.get("shareholderCategory") or "").upper()
+                        pct = _to_float(row.get("percentageOfShareholding")
+                                        or row.get("totPercentShare"))
+                        if pct is None:
+                            continue
+                        if "PROMOTER" in cat:
+                            promoter = pct
+                        elif "FOREIGN" in cat or "FII" in cat or "FPI" in cat:
+                            fii = (fii or 0) + pct
+                        elif "DOMESTIC INST" in cat or "DII" in cat or "MUTUAL" in cat:
+                            dii = (dii or 0) + pct
+                        pledge_pct = _to_float(row.get("pledgeShares")
+                                               or row.get("percentagePledgedShares"))
+                        if pledge_pct is not None and "PROMOTER" in cat:
+                            pledge = pledge_pct
 
-    promoter = _to_float(
-        holdings.get("promoterAndPromoterGroup")
-        or sh.get("promoterAndPromoterGroup")
-        or holdings.get("promoter")
-    )
-    fii = _to_float(
-        holdings.get("foreignInstitutions")
-        or holdings.get("foreignPortfolioInvestors")
-        or holdings.get("fii")
-    )
-    dii = _to_float(
-        holdings.get("domesticInstitutions")
-        or holdings.get("mutualFunds")
-        or holdings.get("dii")
-    )
-    pledge = _to_float(sh.get("pledgeOfShare") or sh.get("pledge"))
+                    if promoter is not None:
+                        logger.debug("NSE shareholding-pattern OK for %s: promoter=%.2f%%", sym, promoter)
+                        result.update(promoter_holding=promoter, fii_holding=fii,
+                                      dii_holding=dii, promoter_pledge=pledge)
+                        return result
 
-    result.update(
-        promoter_holding=promoter,
-        fii_holding=fii,
-        dii_holding=dii,
-        promoter_pledge=pledge,
-    )
+                # ---- Endpoint 2: quote-equity fallback ------------------------
+                r2 = await client.get(
+                    "https://www.nseindia.com/api/quote-equity",
+                    params={"symbol": sym},
+                    timeout=8,
+                )
+                if r2.status_code == 200:
+                    payload = r2.json()
+                    sh       = payload.get("securityInfo", {}) or {}
+                    holdings = payload.get("shareholdingPattern", {}) or {}
+                    summary  = payload.get("summaryInfo", {}) or {}
+
+                    promoter = _to_float(
+                        holdings.get("promoterAndPromoterGroup")
+                        or sh.get("promoterAndPromoterGroup")
+                        or holdings.get("promoter")
+                        or summary.get("promoterAndPromoterGroup")
+                    )
+                    fii = _to_float(
+                        holdings.get("foreignPortfolioInvestors")
+                        or holdings.get("foreignInstitutions")
+                        or holdings.get("fii")
+                        or summary.get("foreignPortfolioInvestors")
+                    )
+                    dii = _to_float(
+                        holdings.get("mutualFunds")
+                        or holdings.get("domesticInstitutions")
+                        or holdings.get("dii")
+                        or summary.get("mutualFunds")
+                    )
+                    pledge = _to_float(sh.get("pledgeOfShare") or sh.get("pledge"))
+
+                    if promoter is not None:
+                        logger.debug("NSE quote-equity shareholding OK for %s: promoter=%.2f%%", sym, promoter)
+                    result.update(promoter_holding=promoter, fii_holding=fii,
+                                  dii_holding=dii, promoter_pledge=pledge)
+
+        except Exception as exc:
+            logger.debug("NSE shareholding fetch failed for %s: %s", sym, exc)
+
     return result
 
 
