@@ -1,135 +1,277 @@
 # QuantEdge AI
 
-Institutional-grade full-stack quantitative stock research and trading dashboard.
+Institutional-grade full-stack quantitative stock research and paper trading dashboard for Indian equities (NSE/BSE).
 
-- **Backend** — FastAPI + pandas/NumPy AlphaScan engine, TwelveData/Alpha Vantage
-  data layer, Claude (Anthropic) CORS-safe proxy, OpenAI GPT-4o trade narratives.
-- **Frontend** — React 18 + Vite + Recharts + Lucide, five-tab dark-mode cockpit:
-  Scanner, Backtest, ML Models, AI Insights, and the local AlphaScan engine.
+- **Backend** — FastAPI + pandas/NumPy multi-gate scoring engine, real ML model training (XGBoost / LightGBM / RandomForest), WebSocket live prices, paper trading engine with Telegram alerts, Angel One SmartAPI broker integration, Claude Haiku AI trade narratives.
+- **Frontend** — React 18 + Vite + Recharts + Lucide, six-tab dark-mode cockpit with WebSocket live price feed.
+- **Deployed** — Backend on [Render](https://quantedge-ai-2ru3.onrender.com) · Frontend on [Vercel](https://quant-edge-ai.vercel.app)
+
+---
+
+## File structure
 
 ```
 quantedge-ai/
 ├── backend/
-│   ├── main.py              # FastAPI server + AlphaScan engine + Claude proxy
+│   ├── main.py              # FastAPI server — all endpoints + engines
 │   ├── requirements.txt
 │   └── .env.example
 ├── frontend/
 │   ├── src/
-│   │   ├── App.jsx          # Full React dashboard (5 tabs)
-│   │   ├── main.jsx
-│   │   └── App.css
+│   │   ├── App.jsx                     # Thin shell — state + tab router
+│   │   ├── constants.js                # Colour palette, API_BASE, TOKEN_KEY
+│   │   ├── utils/
+│   │   │   ├── api.js                  # All fetch helpers + JWT interceptor
+│   │   │   ├── format.js               # fmt, fmtPct, formatCrore
+│   │   │   └── indicators.js           # mlScoreFromData, computeSetup
+│   │   ├── hooks/
+│   │   │   ├── useWebSocket.js         # WS auto-reconnect hook
+│   │   │   ├── useMarketStatus.js
+│   │   │   └── usePaperPortfolio.js
+│   │   └── components/
+│   │       ├── Header.jsx
+│   │       ├── TopKpiStrip.jsx
+│   │       ├── LockScreen.jsx
+│   │       ├── ScannerTab.jsx
+│   │       ├── BacktestTab.jsx
+│   │       ├── MLTab.jsx
+│   │       ├── InsightsTab.jsx
+│   │       ├── AlphaScanTab.jsx
+│   │       ├── PaperTradingPanel.jsx
+│   │       ├── TelegramPanel.jsx
+│   │       └── BrokerPanel.jsx
 │   ├── index.html
 │   ├── package.json
-│   └── vite.config.js       # Port 3000 + proxy /api, /proxy, /scan-best-stock
-├── start.sh                 # Mac/Linux one-command launcher
-├── start.bat                # Windows one-command launcher
+│   ├── vercel.json
+│   └── vite.config.js
+├── render.yaml              # Render deploy config (backend)
 └── README.md
 ```
 
-## Quick start
+---
+
+## Quick start (local)
 
 ### Mac / Linux
 
 ```bash
 cd quantedge-ai
-chmod +x start.sh   # first time only
-./start.sh
+
+# Backend
+cd backend
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env        # fill in your keys
+uvicorn main:app --port 8000 --reload
+
+# Frontend (new terminal)
+cd frontend
+npm install
+npm run dev                 # opens http://localhost:3000
 ```
 
 ### Windows
 
 ```bat
-cd quantedge-ai
-start.bat
+cd quantedge-ai\backend
+python -m venv .venv && .venv\Scripts\activate
+pip install -r requirements.txt
+copy .env.example .env
+uvicorn main:app --port 8000 --reload
 ```
 
-Then open **<http://localhost:3000>**.
+```bat
+cd quantedge-ai\frontend
+npm install && npm run dev
+```
 
-The launcher does everything:
-
-1. Creates `backend/.venv` if missing, installs `requirements.txt`.
-2. Creates `backend/.env` from `.env.example` on first run (fill in keys!).
-3. Starts **FastAPI** on `http://localhost:8000`.
-4. Runs `npm install` for the frontend if needed.
-5. Starts the **Vite** dev server on `http://localhost:3000`.
-
-Press `Ctrl+C` (Mac/Linux) or close the two terminal windows (Windows) to stop.
+---
 
 ## Environment variables
 
-Edit `backend/.env` (never commit it — only `.env.example` is tracked):
+Create `backend/.env` (never commit — only `.env.example` is tracked):
 
-| Variable | Purpose |
-|---|---|
-| `TWELVEDATA_API_KEY` | Primary OHLCV source for AlphaScan |
-| `ALPHA_VANTAGE_API_KEY` | OHLCV fallback when TwelveData fails |
-| `POLYGON_API_KEY` | Optional (reserved for US coverage) |
-| `OPENAI_API_KEY` | GPT-4o trade narratives on `/scan-best-stock` |
-| `ANTHROPIC_API_KEY` | Powers the `/proxy/claude` endpoint the frontend uses |
+| Variable | Purpose | Required |
+|---|---|---|
+| `MASTER_PASSWORD` | Vault unlock password for the app | Yes |
+| `ANTHROPIC_API_KEY` | Claude Haiku AI trade narratives | Yes |
+| `TWELVEDATA_API_KEY` | Primary OHLCV + fundamentals source | Yes |
+| `ALPHA_VANTAGE_API_KEY` | Fundamentals fallback (sector, growth) | Yes |
+| `POLYGON_API_KEY` | Optional — reserved for US coverage | No |
+| `TELEGRAM_BOT_TOKEN` | Telegram trade alert notifications | Optional |
+| `TELEGRAM_CHAT_ID` | Your Telegram chat ID | Optional |
+| `ANGEL_CLIENT_ID` | Angel One SmartAPI client ID | Optional |
+| `ANGEL_PASSWORD` | Angel One login password | Optional |
+| `ANGEL_TOTP_SECRET` | Angel One TOTP secret for 2FA | Optional |
+| `ANGEL_API_KEY` | Angel One API key | Optional |
 
 Get keys at:
-- <https://twelvedata.com> · <https://www.alphavantage.co> · <https://polygon.io>
-- <https://platform.openai.com> · <https://console.anthropic.com>
+- [twelvedata.com](https://twelvedata.com) · [alphavantage.co](https://www.alphavantage.co)
+- [console.anthropic.com](https://console.anthropic.com)
+- [smartapi.angelone.in](https://smartapi.angelone.in)
 
-## Endpoints
-
-| Method | Path | Purpose |
-|---|---|---|
-| `GET` | `/` | Service info |
-| `GET` | `/health` | `{"status":"ok", ...}` |
-| `POST` | `/proxy/claude` | CORS-safe Claude proxy (web-search tool enabled on demand) |
-| `POST` | `/scan-best-stock` | Runs the AlphaScan engine over NIFTY 500 |
-
-### AlphaScan engine
-
-Scores across 5 dimensions, 20 points each (total 0–100):
-
-- **Trend** — price above 200 EMA, 20 > 50 > 200 stack, price > VWAP.
-- **Volume** — 20-day volume-ratio tiers (1.5×, 2.0×, 2.5×).
-- **Pattern** — strongest bullish candle / breakout pattern.
-- **Momentum** — RSI 50–70 zone, MACD histogram, bullish MACD cross.
-- **Institutional** — break of structure, higher highs, liquidity grab, volume
-  accumulation.
-
-Seven hard conditions **must all pass** before a score is emitted:
-
-1. Price above 200 EMA
-2. EMA 20 > EMA 50 > EMA 200
-3. Bullish pattern strength ≥ 15
-4. Volume > 1.5× 20-day average
-5. Break of structure confirmed
-6. RSI between 50 and 70
-7. No strong resistance within 3 %
-
-The engine only returns a trade if the survivor's total score ≥ 90; otherwise
-`{ "trade_found": false, "no_trade": { ... } }`. Results are cached in memory
-for 5 minutes. OHLCV per symbol is cached for 5 minutes. Concurrency is capped
-at 8 via `asyncio.Semaphore`.
+---
 
 ## Dashboard tabs
 
-1. **Scanner** — Manage watchlist, run live web-search Claude scans, see a
-   results table (price, Δ%, entry, stop, target, R:R, pattern, RSI, ML score).
-2. **Backtest** — 8 KPI cards, equity curve vs benchmark, monthly return bars.
-3. **ML Models** — 4 model cards, radar comparison, feature-importance bars.
-4. **AI Insights** — Per-symbol institutional trade thesis generated by Claude.
-5. **AlphaScan** — Animated score ring, winner banner, EMA structure cards,
-   MACD/ATR cards, AI analysis.
+| Tab | What it does |
+|---|---|
+| **Scanner** | Watchlist manager — live price feed via WebSocket, per-symbol scan (RSI, EMA, MACD, pattern, R:R), one-click AI Insights |
+| **Backtest** | Equity curve vs NIFTY benchmark, 8 KPI cards (CAGR, Sharpe, max drawdown, win rate), monthly returns heatmap |
+| **ML Models** | Train real XGBoost / LightGBM / RandomForest / GradientBoosting models on NIFTY 500 OHLCV — shows AUC, accuracy, feature importance |
+| **AI Insights** | Per-symbol institutional trade thesis via Claude Haiku — honest narrative that reflects actual gate results |
+| **AlphaScan** | Full NIFTY 500 scan — 4-gate scoring (technical 40 + fundamentals 25 + backtest 20 + risk-reward 15), deep analysis, auto paper trade |
+| **Broker** | Angel One SmartAPI integration — connect, view funds/positions/holdings, place orders, sync paper trades to live |
+
+---
+
+## AlphaScan scoring engine
+
+Four gates must all pass and combined score ≥ 90 for a trade signal:
+
+### Technical gate (40 pts)
+- Price above 200 EMA
+- EMA 20 > EMA 50 > EMA 200 (bullish stack)
+- Bullish pattern strength ≥ 15
+- Volume > 1.5× 20-day average
+- Break of structure confirmed
+- RSI between 50–70
+- No strong resistance within 3%
+
+### Fundamentals gate (25 pts)
+- P/E ≤ 50
+- Debt/Equity ≤ 1.0
+- ROE ≥ 12%
+- Revenue growth ≥ 10%
+- Profit growth > 0
+- Promoter holding ≥ 40%
+- FII + DII ≥ 15%
+
+### Backtest gate (20 pts)
+- ≥ 10 historical signals
+- Win rate ≥ 55%
+- Profit factor ≥ 1.5
+- Average return ≥ 2%
+
+### Risk/Reward gate (15 pts)
+- R:R ≥ 2.0
+- Risk ≤ 3% of price
+- ATR ≤ 5% of price
+
+---
+
+## Fundamentals data sources (4-layer fallback)
+
+| Priority | Source | Fields |
+|---|---|---|
+| 1 | TwelveData `/statistics` | PE, D/E, ROE, market cap, book value |
+| 2 | Alpha Vantage `OVERVIEW` | PE, ROE, revenue/profit growth, sector |
+| 3 | Yahoo Finance (`yfinance`) | All fields via `fast_info` + financial statements |
+| 4 | Screener.in (HTML scrape) | Promoter %, FII %, DII %, pledge % |
+
+Shareholding fallback chain: NSE API → Screener.in → TwelveData proxy → Yahoo proxy
+
+---
+
+## Paper trading
+
+Configured via the **Paper Trading** panel inside the Broker tab:
+
+- Capital, risk %, max open positions, max hold days
+- Auto-trade: automatically opens a paper trade when AlphaScan score ≥ threshold
+- Monitor runs every 10 seconds — checks stop-loss / target / time exit
+- Telegram alerts on open, close, and daily summary
+
+---
+
+## WebSocket live prices
+
+Connect to `ws://<host>/ws/live-prices` — protocol:
+
+```json
+// Subscribe
+{"action": "subscribe", "symbols": ["RELIANCE", "TCS"]}
+
+// Unsubscribe
+{"action": "unsubscribe", "symbols": ["RELIANCE"]}
+
+// Server → Client (every 5s)
+{"type": "price_update", "symbol": "RELIANCE", "price": 2850.5, "change_pct": 0.45, "volume": 1234567, "ts": "..."}
+```
+
+---
+
+## Key API endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/health` | `{"status":"ok", ...}` |
+| `POST` | `/unlock` | Unlock vault with master password → JWT token |
+| `GET` | `/lock-status` | Check if vault is locked/unlocked |
+| `GET` | `/stock-data/{symbol}` | Live price + indicators (cached 60s) |
+| `GET` | `/deep-analyze/{symbol}` | Full 4-gate analysis + AI narrative |
+| `POST` | `/scan-best-stock` | AlphaScan over NIFTY 500 universe |
+| `POST` | `/train-ml` | Train real ML models on NIFTY 500 OHLCV |
+| `GET` | `/train-ml/latest` | Most recent ML training result |
+| `GET` | `/fundamentals/{symbol}` | Fundamentals snapshot (4-source) |
+| `GET` | `/paper-portfolio` | Open paper positions + unrealised P&L |
+| `GET` | `/paper-trades` | Paper trade history |
+| `GET` | `/paper-equity-curve` | Equity curve data for chart |
+| `PATCH` | `/paper-settings` | Update paper trading configuration |
+| `GET` | `/broker/status` | Angel One connection status |
+| `POST` | `/broker/connect` | Authenticate with Angel One TOTP |
+| `GET` | `/broker/funds` | Available cash + margin |
+| `POST` | `/broker/order` | Place a real order |
+| `POST` | `/broker/sync-paper/{id}` | Replicate paper trade as real order |
+| `WS` | `/ws/live-prices` | WebSocket live price feed |
+| `POST` | `/proxy/claude` | CORS-safe Claude API proxy |
+
+---
 
 ## Tech stack
 
-- **Backend**: FastAPI, httpx, pandas, numpy, pydantic, openai, python-dotenv.
-- **Frontend**: React 18, Vite 5, Recharts 2, Lucide React.
+| Layer | Technologies |
+|---|---|
+| Backend | FastAPI, httpx, pandas, NumPy, pydantic, yfinance, scikit-learn, XGBoost, LightGBM, joblib, PyJWT, cryptography, exchange-calendars, smartapi-python, pyotp |
+| Frontend | React 18, Vite 5, Recharts 2, Lucide React |
+| Deployment | Render (backend, free tier, Singapore) · Vercel (frontend, free tier) |
+| Data | TwelveData, Alpha Vantage, Yahoo Finance, NSE India API, Screener.in |
+| AI | Anthropic Claude Haiku (trade narratives) |
+
+---
+
+## Deployment
+
+### Backend → Render
+
+1. Push to `main` — Render auto-deploys via `render.yaml`
+2. Set secret env vars in Render dashboard (not in `render.yaml`):
+   `MASTER_PASSWORD`, `ANTHROPIC_API_KEY`, `TWELVEDATA_API_KEY`, `ALPHA_VANTAGE_API_KEY`, `TELEGRAM_BOT_TOKEN`, etc.
+3. Python version is pinned to 3.12 via `backend/.python-version`
+
+### Frontend → Vercel
+
+1. Root directory: `quantedge-ai/frontend`
+2. Build command: `npm run build`
+3. Set env var in Vercel dashboard: `VITE_API_BASE=https://quantedge-ai-2ru3.onrender.com`
+4. Redeploy after changing env vars (Vite bakes them at build time)
+
+---
 
 ## Troubleshooting
 
-- **Scanner keeps erroring** → `ANTHROPIC_API_KEY` missing on the backend.
-- **AlphaScan returns "no trade"** → the market genuinely isn't offering a
-  ≥ 90-score setup today. Try again after a few minutes (cache is 5 min).
-- **AlphaScan tab shows "Backend unreachable"** → backend on `:8000` is down.
-  Re-run `./start.sh` or run `python backend/main.py` manually.
-- **Port 3000 / 8000 taken** → kill the occupier or edit `start.sh` / `start.bat`.
+| Issue | Fix |
+|---|---|
+| Spinner on load / "Backend unreachable" | Render free tier cold start — wait 30–60s and refresh |
+| 401 Unauthorized after backend restart | Server session cleared — re-unlock the app |
+| AlphaScan returns "no trade" | No stock cleared all 4 gates with score ≥ 90 today |
+| Fundamentals all null | Check Render logs for `Fundamentals <SYM>:` line — verify API keys are set |
+| yfinance rate limit errors | Normal under load — OHLCV cached 5 min, fundamentals cached 1 hr |
+| Telegram alerts not working | Verify `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in Render env |
+| Angel One connection fails | Check TOTP secret is base32-encoded and system clock is synced |
+
+---
 
 ## License
 
-MIT. For educational and research use. No investment advice.
+MIT. For educational and research purposes only. Not investment advice.
