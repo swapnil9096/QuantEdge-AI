@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { Sparkles, Zap, UserPlus, Shield, TrendingUp, BarChart2, Cpu } from 'lucide-react';
-import { C, GRAD } from '../constants.js';
+import { C, GRAD, TOKEN_KEY } from '../constants.js';
 import { Spinner } from './shared.jsx';
 import { apiAuthLogin, apiAuthRegister } from '../utils/api.js';
 
@@ -38,7 +38,7 @@ export function AuthScreen({ onLoggedIn }) {
     try {
       const fn = tab === 'login' ? apiAuthLogin : apiAuthRegister;
       const res = await fn({ username: username.trim(), password });
-      localStorage.setItem('quantedge_session_token', res.token);
+      localStorage.setItem(TOKEN_KEY, res.token);
       localStorage.setItem('quantedge_user', JSON.stringify({
         user_id: res.user_id, username: res.username, is_admin: res.is_admin,
       }));

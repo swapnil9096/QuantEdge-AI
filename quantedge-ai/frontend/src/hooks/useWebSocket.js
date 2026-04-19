@@ -40,7 +40,17 @@ export function useWebSocket(url) {
     if (!wsUrl) return;  // idle — no URL (vault locked)
     if (wsRef.current && wsRef.current.readyState !== WebSocket.CLOSED) return;
 
-    const ws = new WebSocket(wsUrl);
+    let ws;
+    try {
+      ws = new WebSocket(wsUrl);
+    } catch (err) {
+      // Invalid URL (e.g. relative path when API_BASE is empty) — schedule retry
+      console.warn('[useWebSocket] WebSocket construction failed:', err.message);
+      const delay = Math.min(retryDelay.current, 30000);
+      retryDelay.current = delay * 2;
+      retryRef.current = setTimeout(connect, delay);
+      return;
+    }
     wsRef.current = ws;
 
     ws.onopen = () => {
