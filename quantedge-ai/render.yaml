@@ -24,7 +24,14 @@ services:
     healthCheckPath: /health
     autoDeploy: true
 
+    disk:
+      name: quantedge-data
+      mountPath: /var/data
+      sizeGB: 1
+
     envVars:
+      - key: DATA_DIR
+        value: /var/data
       - key: APP_ENV
         value: production
       - key: LOG_LEVEL
