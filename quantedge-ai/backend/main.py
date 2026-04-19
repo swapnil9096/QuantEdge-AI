@@ -111,26 +111,29 @@ if not SECRET_KEY:
 
 USER_JWT_TTL_SECONDS = int(os.getenv("USER_JWT_TTL_HOURS", "720")) * 3600  # 30 days default
 
-# passlib bcrypt — optional at import time so server still starts without it
+# bcrypt — optional at import time so server still starts without it
 try:
-    from passlib.context import CryptContext as _CryptContext
-    _pwd_context = _CryptContext(schemes=["bcrypt"], deprecated="auto")
+    import bcrypt as _bcrypt_mod
     _BCRYPT_OK = True
 except ImportError:
+    _bcrypt_mod = None
     _BCRYPT_OK = False
-    logger.warning("passlib[bcrypt] not installed. User registration/login will fail.")
+    logger.warning("bcrypt not installed. User registration/login will fail.")
 
 
 def _hash_password(password: str) -> str:
     if not _BCRYPT_OK:
-        raise RuntimeError("passlib[bcrypt] not installed.")
-    return _pwd_context.hash(password)
+        raise RuntimeError("bcrypt not installed — run: pip install bcrypt")
+    return _bcrypt_mod.hashpw(password.encode(), _bcrypt_mod.gensalt()).decode()
 
 
 def _verify_password(plain: str, hashed: str) -> bool:
     if not _BCRYPT_OK:
         return False
-    return _pwd_context.verify(plain, hashed)
+    try:
+        return _bcrypt_mod.checkpw(plain.encode(), hashed.encode())
+    except Exception:
+        return False
 
 
 def _issue_user_token(user_id: int, username: str, is_admin: bool = False) -> dict[str, Any]:
