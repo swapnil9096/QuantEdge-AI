@@ -36,8 +36,10 @@ export function installFetchInterceptor({ onLocked }) {
         const code =
           (body && body.code) ||
           (body && body.detail && body.detail.code);
-        if (code === 'locked') {
+        // Both old 'locked' code and new 'unauthorized' code trigger logout
+        if (code === 'locked' || code === 'unauthorized') {
           localStorage.removeItem(TOKEN_KEY);
+          localStorage.removeItem('quantedge_user');
           onLocked?.();
         }
       } catch {
@@ -54,6 +56,52 @@ export function installFetchInterceptor({ onLocked }) {
 
 // ---------------------------------------------------------------------------
 // Auth API helpers
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// User auth (multi-user)
+// ---------------------------------------------------------------------------
+
+async function _authPost(path, body) {
+  const r = await fetch(`${API_BASE}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  let data = null;
+  try { data = await r.json(); } catch {}
+  if (!r.ok) {
+    const msg = data?.detail || data?.message || `${path} failed (${r.status})`;
+    const err = new Error(typeof msg === 'object' ? JSON.stringify(msg) : msg);
+    err.status = r.status;
+    throw err;
+  }
+  return data;
+}
+
+export const apiAuthLogin    = ({ username, password }) => _authPost('/auth/login',    { username, password });
+export const apiAuthRegister = ({ username, password }) => _authPost('/auth/register', { username, password });
+
+export async function apiAuthMe() {
+  const r = await fetch(`${API_BASE}/auth/me`);
+  if (!r.ok) throw new Error(`auth/me ${r.status}`);
+  return r.json();
+}
+
+export async function apiAuthChangePassword({ current_password, new_password }) {
+  const r = await fetch(`${API_BASE}/auth/change-password`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ current_password, new_password }),
+  });
+  let data = null;
+  try { data = await r.json(); } catch {}
+  if (!r.ok) throw new Error(data?.detail || 'Change password failed.');
+  return data;
+}
+
+// ---------------------------------------------------------------------------
+// Legacy vault unlock (kept for admin use / backward compat)
 // ---------------------------------------------------------------------------
 
 export async function apiUnlock(password) {
@@ -390,6 +438,30 @@ export async function sendTelegramTest() {
 export async function fetchBrokerStatus() {
   const r = await fetch(`${API_BASE}/broker/status`);
   if (!r.ok) throw new Error(`broker/status ${r.status}`);
+  return r.json();
+}
+
+export async function fetchBrokerCredentials() {
+  const r = await fetch(`${API_BASE}/broker/credentials`);
+  if (!r.ok) throw new Error(`broker/credentials ${r.status}`);
+  return r.json();
+}
+
+export async function saveBrokerCredentials(creds) {
+  const r = await fetch(`${API_BASE}/broker/credentials`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(creds),
+  });
+  let data = null;
+  try { data = await r.json(); } catch {}
+  if (!r.ok) throw new Error(data?.detail || `broker/credentials ${r.status}`);
+  return data;
+}
+
+export async function deleteBrokerCredentials() {
+  const r = await fetch(`${API_BASE}/broker/credentials`, { method: 'DELETE' });
+  if (!r.ok) throw new Error(`broker/credentials DELETE ${r.status}`);
   return r.json();
 }
 

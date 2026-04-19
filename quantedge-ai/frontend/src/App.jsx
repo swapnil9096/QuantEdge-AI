@@ -1,10 +1,9 @@
 import React, { useState, useCallback, useEffect } from 'react';
 import {
   Brain, Building2, ChevronRight, Cpu, LineChart as LineIcon,
-  Rocket, Search, Sparkles, Zap,
+  Rocket, Search,
 } from 'lucide-react';
 import { C, API_BASE, TOKEN_KEY } from './constants.js';
-import { Spinner } from './components/shared.jsx';
 import { Header } from './components/Header.jsx';
 import { TopKpiStrip } from './components/TopKpiStrip.jsx';
 import { ScannerTab } from './components/ScannerTab.jsx';
@@ -13,10 +12,10 @@ import { MLTab } from './components/MLTab.jsx';
 import { InsightsTab } from './components/InsightsTab.jsx';
 import { AlphaScanTab } from './components/AlphaScanTab.jsx';
 import { BrokerPanel } from './components/BrokerPanel.jsx';
-import { LockScreen } from './components/LockScreen.jsx';
+import { AuthScreen } from './components/AuthScreen.jsx';
 import { useWebSocket } from './hooks/useWebSocket.js';
 import {
-  installFetchInterceptor, apiUnlock, apiLockStatus, apiLockServer,
+  installFetchInterceptor,
   fetchStockData, fetchBacktest, fetchMLTraining, fetchAIExplanation,
 } from './utils/api.js';
 import { parseSymbol, computeSetup } from './utils/indicators.js';
@@ -68,53 +67,29 @@ export default function App() {
   const [alphaLog, setAlphaLog] = useState([]);
   const [backendDown, setBackendDown] = useState(false);
 
-  // ---- Lock gate -----------------------------------------------------------
-  const [lockStatus, setLockStatus] = useState(null);
-  const [lockVersion, setLockVersion] = useState(0);
+  // ---- Auth gate -----------------------------------------------------------
+  const [currentUser, setCurrentUser] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('quantedge_user')); } catch { return null; }
+  });
 
-  const forceRelock = useCallback(() => {
+  const handleLogout = useCallback(() => {
     localStorage.removeItem(TOKEN_KEY);
-    setLockStatus((prev) => ({ ...(prev || {}), unlocked: false }));
+    localStorage.removeItem('quantedge_user');
+    setCurrentUser(null);
   }, []);
 
   useEffect(() => {
-    const teardown = installFetchInterceptor({ onLocked: forceRelock });
+    const teardown = installFetchInterceptor({ onLocked: handleLogout });
     return teardown;
-  }, [forceRelock]);
+  }, [handleLogout]);
 
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const s = await apiLockStatus();
-        if (cancelled) return;
-        const hasToken = !!localStorage.getItem(TOKEN_KEY);
-        setLockStatus({ ...s, unlocked: s.unlocked && hasToken });
-        setBackendDown(false);
-      } catch {
-        if (!cancelled) {
-          setBackendDown(true);
-          // Resolve the spinner so the UI isn't stuck on load when the
-          // backend is unreachable (e.g. Render free-tier cold start).
-          setLockStatus({ unlocked: false, configured: false });
-        }
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [lockVersion]);
-
-  const handleUnlocked = useCallback(() => setLockVersion((v) => v + 1), []);
-
-  const handleLock = useCallback(async () => {
-    try { await apiLockServer(); } catch { /* clear token even on network failure */ }
-    localStorage.removeItem(TOKEN_KEY);
-    setLockStatus((prev) => ({ ...(prev || {}), unlocked: false }));
-    setLockVersion((v) => v + 1);
+  const handleLoggedIn = useCallback((res) => {
+    setCurrentUser({ user_id: res.user_id, username: res.username, is_admin: res.is_admin });
   }, []);
 
   // ---- WebSocket live prices (Phase 3) ------------------------------------
   const { prices: livePrices, connected: wsConnected, subscribe, unsubscribe } = useWebSocket(
-    lockStatus?.unlocked ? `${API_BASE.replace(/^http/, 'ws')}/ws/live-prices` : null,
+    currentUser ? `${API_BASE.replace(/^http/, 'ws')}/ws/live-prices` : null,
   );
 
   // Subscribe watchlist symbols whenever they change
@@ -240,22 +215,15 @@ export default function App() {
     }
   }, []);
 
-  // ---- Lock gate rendering -------------------------------------------------
-  if (lockStatus === null) {
-    return (
-      <div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', background: C.bg, color: C.muted }}>
-        <Spinner />
-      </div>
-    );
-  }
-  if (!lockStatus.unlocked && !backendDown) {
-    return <LockScreen initialStatus={lockStatus} onUnlocked={handleUnlocked} />;
+  // ---- Auth gate rendering -------------------------------------------------
+  if (!currentUser) {
+    return <AuthScreen onLoggedIn={handleLoggedIn} />;
   }
 
   // ---- Main render ---------------------------------------------------------
   return (
     <div style={{ minHeight: '100vh', background: C.bg, color: C.text }}>
-      <Header lastScan={lastScan} lastError={lastError} onLock={handleLock} wsConnected={wsConnected} />
+      <Header lastScan={lastScan} lastError={lastError} onLogout={handleLogout} wsConnected={wsConnected} currentUser={currentUser} />
       <TopKpiStrip watchlist={watchlist} scanData={scanData} backtest={backtest} ml={ml} />
 
       <nav

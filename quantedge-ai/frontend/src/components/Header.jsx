@@ -1,8 +1,8 @@
 import React from 'react';
-import { ShieldAlert, Sparkles, WifiOff } from 'lucide-react';
+import { LogOut, Sparkles, WifiOff } from 'lucide-react';
 import { C, FONT_MONO } from '../constants.js';
 
-export function Header({ lastScan, lastError, onLock, wsConnected }) {
+export function Header({ lastScan, lastError, onLogout, wsConnected, currentUser }) {
   const live = !!lastScan;
   return (
     <header
@@ -102,34 +102,42 @@ export function Header({ lastScan, lastError, onLock, wsConnected }) {
         <div style={{ fontSize: 11, color: C.muted, fontFamily: FONT_MONO }}>
           {lastScan ? `Last scan: ${new Date(lastScan).toLocaleTimeString()}` : lastError ? 'Error' : '—'}
         </div>
-        {onLock && (
-          <button
-            onClick={onLock}
-            title="Lock QuantEdge AI (clears session, wipes secrets from memory)"
-            style={{
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: 6,
-              padding: '6px 12px',
-              borderRadius: 999,
-              background: C.dark,
-              border: `1px solid ${C.border}`,
-              color: C.muted,
-              fontSize: 12,
-              fontWeight: 600,
-              cursor: 'pointer',
-            }}
-            onMouseEnter={(e) => {
-              e.currentTarget.style.color = C.red;
-              e.currentTarget.style.borderColor = C.red;
-            }}
-            onMouseLeave={(e) => {
-              e.currentTarget.style.color = C.muted;
-              e.currentTarget.style.borderColor = C.border;
-            }}
-          >
-            <ShieldAlert size={12} /> Lock
-          </button>
+        {currentUser && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ fontSize: 12, color: C.muted, fontFamily: FONT_MONO }}>
+              {currentUser.username}
+              {currentUser.is_admin && (
+                <span style={{ marginLeft: 4, color: C.teal, fontSize: 10, fontWeight: 700 }}>ADMIN</span>
+              )}
+            </span>
+            <button
+              onClick={onLogout}
+              title="Sign out"
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 6,
+                padding: '6px 12px',
+                borderRadius: 999,
+                background: C.dark,
+                border: `1px solid ${C.border}`,
+                color: C.muted,
+                fontSize: 12,
+                fontWeight: 600,
+                cursor: 'pointer',
+              }}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.color = C.red;
+                e.currentTarget.style.borderColor = C.red;
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.color = C.muted;
+                e.currentTarget.style.borderColor = C.border;
+              }}
+            >
+              <LogOut size={12} /> Sign out
+            </button>
+          </div>
         )}
       </div>
     </header>
