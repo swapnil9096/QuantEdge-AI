@@ -1295,6 +1295,7 @@ def _to_float(value: Any) -> Optional[float]:
 async def _fetch_twelvedata_statistics(symbol: str) -> dict[str, Any]:
     """Fetch fundamentals from TwelveData /statistics endpoint.
     Returns normalised dict; all values None on failure.
+    TwelveData JSON schema: data.statistics.{valuations_metrics, financials, stock_statistics}
     """
     if not TWELVEDATA_API_KEY:
         return {}
@@ -1312,20 +1313,23 @@ async def _fetch_twelvedata_statistics(symbol: str) -> dict[str, Any]:
             if data.get("status") == "error" or "statistics" not in data:
                 logger.debug("TwelveData statistics %s error: %s", td_symbol, data.get("message"))
                 return {}
-            st = data["statistics"]
-            val = st.get("valuations_metrics", {}) or {}
-            fin = st.get("financials", {}) or {}
+            st    = data["statistics"]
+            val   = st.get("valuations_metrics", {}) or {}
+            fin   = st.get("financials", {}) or {}
             stock = st.get("stock_statistics", {}) or {}
 
-            pe      = _to_float(val.get("trailing_pe") or val.get("forward_pe"))
-            mcap    = _to_float(val.get("market_capitalization"))
-            pb      = _to_float(val.get("price_to_book_mrq"))
-            bv      = _to_float(stock.get("book_value_per_share"))
-            eps     = _to_float(stock.get("eps_ttm") or stock.get("diluted_eps_ttm"))
-            de      = _to_float(fin.get("total_debt_to_equity_mrq"))
-            roe     = _to_float(fin.get("return_on_equity_ttm"))
-            rev_g   = _to_float(fin.get("quarterly_revenue_growth_yoy"))
-            ni_g    = _to_float(fin.get("quarterly_earnings_growth_yoy"))
+            pe    = _to_float(val.get("trailing_pe") or val.get("forward_pe"))
+            mcap  = _to_float(val.get("market_capitalization"))
+            # book_value_per_share_mrq lives in financials; eps_ttm in stock_statistics
+            bv    = _to_float(fin.get("book_value_per_share_mrq") or stock.get("book_value_per_share"))
+            eps   = _to_float(stock.get("eps_ttm") or fin.get("diluted_eps_ttm"))
+            de    = _to_float(fin.get("total_debt_to_equity_mrq"))
+            roe   = _to_float(fin.get("return_on_equity_ttm"))
+            rev_g = _to_float(fin.get("quarterly_revenue_growth_yoy"))
+            ni_g  = _to_float(fin.get("quarterly_earnings_growth_yoy"))
+            # insider / institution holding proxies
+            insider_pct = _to_float(stock.get("percent_held_by_insiders"))
+            inst_pct    = _to_float(stock.get("percent_held_by_institutions"))
 
             # normalise fractions → percent where needed
             if roe is not None and -2 <= roe <= 2:
@@ -1334,16 +1338,16 @@ async def _fetch_twelvedata_statistics(symbol: str) -> dict[str, Any]:
                 rev_g *= 100
             if ni_g is not None and -2 <= ni_g <= 2:
                 ni_g *= 100
+            if insider_pct is not None and 0 <= insider_pct <= 1:
+                insider_pct *= 100
+            if inst_pct is not None and 0 <= inst_pct <= 1:
+                inst_pct *= 100
 
             result = {
-                "pe_ratio": pe,
-                "debt_to_equity": de,
-                "roe": roe,
-                "revenue_growth": rev_g,
-                "profit_growth": ni_g,
-                "book_value": bv,
-                "market_cap": mcap,
-                "eps": eps,
+                "pe_ratio": pe, "debt_to_equity": de, "roe": roe,
+                "revenue_growth": rev_g, "profit_growth": ni_g,
+                "book_value": bv, "market_cap": mcap, "eps": eps,
+                "insider_pct": insider_pct, "institutions_pct": inst_pct,
             }
             populated = sum(1 for v in result.values() if v is not None)
             logger.debug("TwelveData statistics %s → %d fields populated", td_symbol, populated)
@@ -1355,62 +1359,69 @@ async def _fetch_twelvedata_statistics(symbol: str) -> dict[str, Any]:
 
 async def _fetch_alphavantage_overview(symbol: str) -> dict[str, Any]:
     """Fetch fundamentals from Alpha Vantage OVERVIEW endpoint.
+    For Indian stocks uses {SYMBOL}.BSE which has the best AV coverage.
     Returns normalised dict; all values None on failure.
     """
     if not ALPHA_VANTAGE_API_KEY:
         return {}
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(
-                "https://www.alphavantage.co/query",
-                params={
-                    "function": "OVERVIEW",
-                    "symbol": symbol.upper(),
-                    "apikey": ALPHA_VANTAGE_API_KEY,
-                },
-            )
-            if r.status_code != 200:
-                return {}
-            data = r.json()
-            if "Symbol" not in data:
-                logger.debug("AlphaVantage OVERVIEW %s: no Symbol key — %s", symbol, str(data)[:80])
-                return {}
+    # Alpha Vantage India coverage: try BSE-suffixed symbol first, then plain
+    for av_symbol in (f"{symbol.upper()}.BSE", symbol.upper()):
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.get(
+                    "https://www.alphavantage.co/query",
+                    params={
+                        "function": "OVERVIEW",
+                        "symbol": av_symbol,
+                        "apikey": ALPHA_VANTAGE_API_KEY,
+                    },
+                )
+                if r.status_code != 200:
+                    continue
+                data = r.json()
+                if "Symbol" not in data or not data.get("Name"):
+                    # Empty response or rate-limit note
+                    logger.debug("AlphaVantage OVERVIEW %s: no data — %s", av_symbol, str(data)[:80])
+                    continue
 
-            def av(key: str) -> Optional[float]:
-                v = data.get(key)
-                if v in (None, "None", "-", ""):
-                    return None
-                return _to_float(v)
+                def av(key: str) -> Optional[float]:
+                    v = data.get(key)
+                    if v in (None, "None", "N/A", "-", ""):
+                        return None
+                    return _to_float(v)
 
-            pe       = av("PERatio") or av("ForwardPE")
-            de       = av("DebtToEquityRatio")
-            roe      = av("ReturnOnEquityTTM")
-            rev_g    = av("RevenueGrowthTTM") or av("QuarterlyRevenueGrowthYOY")
-            ni_g     = av("EarningsGrowthTTM") or av("QuarterlyEarningsGrowthYOY")
-            bv       = av("BookValue")
-            mcap     = av("MarketCapitalization")
-            sector   = data.get("Sector", "")
-            industry = data.get("Industry", "")
+                # Verified AV OVERVIEW field names (as of 2024-25)
+                pe    = av("PERatio") or av("ForwardPE")
+                roe   = av("ReturnOnEquityTTM")
+                rev_g = av("QuarterlyRevenueGrowthYOY")
+                ni_g  = av("QuarterlyEarningsGrowthYOY")
+                bv    = av("BookValue")
+                mcap  = av("MarketCapitalization")
+                # AV does not expose D/E directly; will be None → fall to yfinance
+                de    = None
+                sector   = data.get("Sector") or ""
+                industry = data.get("Industry") or ""
 
-            if roe is not None and -2 <= roe <= 2:
-                roe *= 100
-            if rev_g is not None and -2 <= rev_g <= 2:
-                rev_g *= 100
-            if ni_g is not None and -2 <= ni_g <= 2:
-                ni_g *= 100
+                if roe is not None and -2 <= roe <= 2:
+                    roe *= 100
+                if rev_g is not None and -2 <= rev_g <= 2:
+                    rev_g *= 100
+                if ni_g is not None and -2 <= ni_g <= 2:
+                    ni_g *= 100
 
-            result = {
-                "pe_ratio": pe, "debt_to_equity": de, "roe": roe,
-                "revenue_growth": rev_g, "profit_growth": ni_g,
-                "book_value": bv, "market_cap": mcap,
-                "sector": sector, "industry": industry,
-            }
-            populated = sum(1 for v in result.values() if v is not None)
-            logger.debug("AlphaVantage OVERVIEW %s → %d fields populated", symbol, populated)
-            return result
-    except Exception as exc:
-        logger.debug("AlphaVantage OVERVIEW failed for %s: %s", symbol, exc)
-        return {}
+                result = {
+                    "pe_ratio": pe, "debt_to_equity": de, "roe": roe,
+                    "revenue_growth": rev_g, "profit_growth": ni_g,
+                    "book_value": bv, "market_cap": mcap,
+                    "sector": sector, "industry": industry,
+                }
+                populated = sum(1 for v in result.values() if v is not None)
+                logger.debug("AlphaVantage OVERVIEW %s → %d fields populated", av_symbol, populated)
+                return result
+        except Exception as exc:
+            logger.debug("AlphaVantage OVERVIEW failed for %s: %s", av_symbol, exc)
+            continue
+    return {}
 
 
 def _fetch_yahoo_fundamentals_sync(yahoo_symbol: str) -> dict[str, Any]:
@@ -1677,7 +1688,7 @@ async def fetch_fundamentals(symbol: str, exchange: str = "NSE") -> Fundamentals
     sector        = av_data.get("sector") or yahoo_data.get("sector") or SECTOR_MAP.get(symbol.upper(), "")
     industry      = av_data.get("industry") or yahoo_data.get("industry") or ""
 
-    # Shareholding: NSE API → Yahoo insider proxy
+    # Shareholding: NSE API → TwelveData insiders proxy → Yahoo insider proxy
     promoter_holding = nse_data.get("promoter_holding")
     fii              = nse_data.get("fii_holding")
     dii              = nse_data.get("dii_holding")
@@ -1686,14 +1697,29 @@ async def fetch_fundamentals(symbol: str, exchange: str = "NSE") -> Fundamentals
     if nse_available:
         sources.append("nse")
 
-    if promoter_holding is None and yahoo_data.get("insider_pct") is not None:
-        promoter_holding = yahoo_data["insider_pct"]
-        sources.append("yahoo-insider-proxy")
-    if (fii is None and dii is None) and yahoo_data.get("institutions_pct") is not None:
-        combined = yahoo_data["institutions_pct"]
-        fii = combined / 2
-        dii = combined / 2
-        sources.append("yahoo-institutions-proxy")
+    # Fallback promoter proxy: TwelveData insider % → Yahoo insider %
+    if promoter_holding is None:
+        for proxy_src, proxy_data, proxy_label in [
+            ("td_insider_proxy", td_data, "twelvedata-insider-proxy"),
+            ("yf_insider_proxy", yahoo_data, "yahoo-insider-proxy"),
+        ]:
+            if proxy_data.get("insider_pct") is not None:
+                promoter_holding = proxy_data["insider_pct"]
+                sources.append(proxy_label)
+                break
+
+    # Fallback FII+DII proxy: TwelveData institutions % → Yahoo institutions %
+    if fii is None and dii is None:
+        for proxy_data, proxy_label in [
+            (td_data, "twelvedata-institutions-proxy"),
+            (yahoo_data, "yahoo-institutions-proxy"),
+        ]:
+            if proxy_data.get("institutions_pct") is not None:
+                combined = proxy_data["institutions_pct"]
+                fii = combined / 2
+                dii = combined / 2
+                sources.append(proxy_label)
+                break
 
     logger.info(
         "Fundamentals %s: pe=%s d/e=%s roe=%s rev_g=%s sources=%s",
