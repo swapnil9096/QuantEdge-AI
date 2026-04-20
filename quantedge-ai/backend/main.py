@@ -300,6 +300,7 @@ _API_PATH_PREFIXES: tuple[str, ...] = (
     "/train-ml",
     "/dashboard/",
     "/news/",
+    "/admin/",
     "/ws/",
     "/docs",
     "/openapi.json",
@@ -3396,7 +3397,7 @@ def _init_user_schema() -> None:
                 )
             # Ensure admin has a paper settings row
             conn.execute(
-                "INSERT OR IGNORE INTO user_paper_settings (user_id) VALUES (?)", (admin_id,)
+                "INSERT OR IGNORE INTO user_paper_settings (user_id) VALUES (?)", (admin_id,)  # admin bootstrap — keep simple
             )
 
 
@@ -3995,6 +3996,44 @@ _PAPER_SETTINGS_DEFAULTS: dict[str, Any] = {
 }
 
 
+def _ensure_user_paper_settings(conn, user_id: int) -> None:
+    """Create a settings row for a user with correct Python defaults (not SQL column defaults)."""
+    existing = conn.execute("SELECT 1 FROM user_paper_settings WHERE user_id=?", (user_id,)).fetchone()
+    if existing:
+        return
+    d = _PAPER_SETTINGS_DEFAULTS
+    conn.execute(
+        """INSERT INTO user_paper_settings (
+            user_id, auto_trade_enabled, auto_trade_threshold, auto_trade_market_open_only,
+            starting_capital, risk_per_trade_pct, max_open_positions, max_hold_days,
+            telegram_on_open, telegram_on_close, telegram_on_error,
+            telegram_on_high_probability, telegram_high_probability_threshold, telegram_daily_summary,
+            sl_mode, atr_multiplier, trailing_activation_pct, partial_exit_enabled, partial_exit_ratio
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            user_id,
+            1 if d["auto_trade_enabled"] else 0,
+            d["auto_trade_threshold"],
+            1 if d["auto_trade_market_open_only"] else 0,
+            d["starting_capital"],
+            d["risk_per_trade_pct"],
+            d["max_open_positions"],
+            d["max_hold_days"],
+            1 if d["telegram_on_open"] else 0,
+            1 if d["telegram_on_close"] else 0,
+            1 if d["telegram_on_error"] else 0,
+            1 if d["telegram_on_high_probability"] else 0,
+            d["telegram_high_probability_threshold"],
+            1 if d["telegram_daily_summary"] else 0,
+            d["sl_mode"],
+            d["atr_multiplier"],
+            d["trailing_activation_pct"],
+            1 if d["partial_exit_enabled"] else 0,
+            d["partial_exit_ratio"],
+        ),
+    )
+
+
 def _get_user_paper_settings(user_id: int) -> dict[str, Any]:
     """Load per-user paper settings from DB, falling back to defaults."""
     with _db_lock, _db_connect() as conn:
@@ -4002,11 +4041,8 @@ def _get_user_paper_settings(user_id: int) -> dict[str, Any]:
             "SELECT * FROM user_paper_settings WHERE user_id=?", (user_id,)
         ).fetchone()
     if row is None:
-        # Auto-create default row for this user
         with _db_lock, _db_connect() as conn:
-            conn.execute(
-                "INSERT OR IGNORE INTO user_paper_settings (user_id) VALUES (?)", (user_id,)
-            )
+            _ensure_user_paper_settings(conn, user_id)
         return dict(_PAPER_SETTINGS_DEFAULTS)
     settings = dict(_PAPER_SETTINGS_DEFAULTS)
     _bool_keys = {
@@ -4050,9 +4086,7 @@ def _update_user_paper_settings(user_id: int, updates: dict[str, Any]) -> dict[s
 
     # Ensure row exists
     with _db_lock, _db_connect() as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO user_paper_settings (user_id) VALUES (?)", (user_id,)
-        )
+        _ensure_user_paper_settings(conn, user_id)
         for k, v in updates.items():
             if k not in allowed:
                 continue
@@ -4943,9 +4977,7 @@ async def auth_register(req: AuthRegisterRequest) -> dict[str, Any]:
         user_id = conn.execute(
             "SELECT id FROM users WHERE username=?", (req.username,)
         ).fetchone()["id"]
-        conn.execute(
-            "INSERT OR IGNORE INTO user_paper_settings (user_id) VALUES (?)", (user_id,)
-        )
+        _ensure_user_paper_settings(conn, user_id)
     logger.info("New user registered: %s (id=%d, admin=%s)", req.username, user_id, bool(is_admin))
     _db_backup()
     return {"ok": True, **_issue_user_token(user_id, req.username, bool(is_admin))}
