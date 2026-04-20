@@ -232,6 +232,26 @@ except ImportError:
 
 _data_dir = Path(os.getenv("DATA_DIR", str(Path(__file__).resolve().parent / "data")))
 _data_dir.mkdir(parents=True, exist_ok=True)
+
+if os.getenv("APP_ENV") == "production":
+    _marker = _data_dir / ".persist_check"
+    if _marker.exists():
+        logger.info("Persistent disk verified at %s (marker survived restart).", _data_dir)
+    else:
+        _marker.write_text(datetime.now(timezone.utc).isoformat())
+        logger.warning(
+            "PERSISTENCE MARKER written to %s. If this message appears on EVERY deploy, "
+            "your disk is NOT persistent — all user data WILL be lost. "
+            "Attach a Render Disk at /var/data and set DATA_DIR=/var/data.",
+            _data_dir,
+        )
+    if str(_data_dir).startswith("/app") or str(_data_dir) == str(Path(__file__).resolve().parent / "data"):
+        logger.error(
+            "DATA_DIR=%s is inside the app directory — this is EPHEMERAL on Render/Docker. "
+            "Set DATA_DIR=/var/data with a persistent disk attached, or all data will be lost on deploy.",
+            _data_dir,
+        )
+
 SECRETS_VAULT_PATH = _data_dir / "secrets.enc.json"
 SECRETS_VAULT_AAD = b"quantedge-secrets-v1"
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_HOURS", "24")) * 3600
@@ -2593,6 +2613,7 @@ async def deep_analyze(symbol: str, exchange: str = "NSE") -> dict[str, Any]:
 
 
 DB_PATH = _data_dir / "quantedge.db"
+_DB_BACKUP_PATH = _data_dir / "quantedge.db.backup"
 
 _db_lock = threading.Lock()  # single SQLite writer; reads are safe concurrently
 
@@ -2600,10 +2621,44 @@ _db_lock = threading.Lock()  # single SQLite writer; reads are safe concurrently
 def _db_connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=10.0, isolation_level=None)
     conn.row_factory = sqlite3.Row
-    # WAL keeps readers unblocked while writers commit; good default for a single-file DB.
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     return conn
+
+
+_last_backup_time: float = 0.0
+_BACKUP_INTERVAL = 300  # backup at most once every 5 minutes
+
+
+def _db_backup() -> None:
+    """Incremental backup of the SQLite DB. Called after important writes."""
+    global _last_backup_time
+    now = time.monotonic()
+    if now - _last_backup_time < _BACKUP_INTERVAL:
+        return
+    _last_backup_time = now
+    try:
+        import shutil
+        shutil.copy2(DB_PATH, _DB_BACKUP_PATH)
+    except Exception as exc:
+        logger.debug("DB backup failed: %s", exc)
+
+
+def _db_restore_if_empty() -> None:
+    """On startup, if the main DB is missing/empty but a backup exists, restore it."""
+    if DB_PATH.exists() and DB_PATH.stat().st_size > 0:
+        return
+    if not _DB_BACKUP_PATH.exists() or _DB_BACKUP_PATH.stat().st_size == 0:
+        return
+    try:
+        import shutil
+        shutil.copy2(_DB_BACKUP_PATH, DB_PATH)
+        logger.info("Restored database from backup (%d bytes).", _DB_BACKUP_PATH.stat().st_size)
+    except Exception as exc:
+        logger.error("DB restore from backup failed: %s", exc)
+
+
+_db_restore_if_empty()
 
 
 def _init_history_schema() -> None:
@@ -3709,6 +3764,7 @@ def _insert_trade_sync(trade: dict[str, Any], user_id: Optional[int] = None, sta
                 """,
                 (tid, "BUY", "OPEN", entry, qty, now),
             )
+    _db_backup()
     return tid
 
 
@@ -3764,6 +3820,7 @@ def _close_trade_sync(
             """,
             (int(trade_id), "SELL", exit_reason, float(close_price), remaining, closed_at),
         )
+    _db_backup()
     return _fetch_trade_sync(trade_id)
 
 
@@ -4766,6 +4823,20 @@ async def health() -> dict[str, Any]:
     return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
+@app.post("/admin/backup-db")
+async def admin_backup_db(user: dict = Depends(get_current_user)) -> dict[str, Any]:
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Admin only.")
+    import shutil
+    try:
+        shutil.copy2(DB_PATH, _DB_BACKUP_PATH)
+        size = _DB_BACKUP_PATH.stat().st_size
+        logger.info("Manual DB backup by admin: %d bytes", size)
+        return {"ok": True, "backup_path": str(_DB_BACKUP_PATH), "size_bytes": size}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Backup failed: {exc}") from exc
+
+
 # ---- Secrets-vault endpoints --------------------------------------------
 
 
@@ -4876,6 +4947,7 @@ async def auth_register(req: AuthRegisterRequest) -> dict[str, Any]:
             "INSERT OR IGNORE INTO user_paper_settings (user_id) VALUES (?)", (user_id,)
         )
     logger.info("New user registered: %s (id=%d, admin=%s)", req.username, user_id, bool(is_admin))
+    _db_backup()
     return {"ok": True, **_issue_user_token(user_id, req.username, bool(is_admin))}
 
 
