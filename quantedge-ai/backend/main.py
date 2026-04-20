@@ -5532,7 +5532,8 @@ def _fetch_news_sentiment_sync(symbol: str) -> dict[str, Any]:
         return {"symbol": symbol.upper(), "sentiment_score": 0, "sentiment_label": "Neutral",
                 "article_count": 0, "activity_spike": False, "articles": [], "error": "feedparser not installed"}
 
-    query = f"{symbol} stock NSE"
+    from urllib.parse import quote
+    query = quote(f"{symbol} stock NSE")
     url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
     feed = feedparser.parse(url)
     articles = []
