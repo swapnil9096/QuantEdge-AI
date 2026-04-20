@@ -4079,6 +4079,16 @@ async def open_paper_trade(
 
     effective_atr = atr_at_entry or max((entry_price - stop_loss) / 1.5, entry_price * 0.005)
 
+    current_price: Optional[float] = None
+    try:
+        live = await asyncio.to_thread(_fetch_live_stock_data, symbol, exchange)
+        current_price = float(live["price"])
+    except Exception:
+        pass
+
+    fill_now = current_price is not None and current_price <= entry_price
+    trade_status = "OPEN" if fill_now else "PENDING"
+
     payload = {
         "symbol": symbol,
         "exchange": exchange,
@@ -4096,11 +4106,11 @@ async def open_paper_trade(
         "atr_at_entry": effective_atr,
         "target2_price": target2_price,
     }
-    tid = await asyncio.to_thread(_insert_trade_sync, payload, user_id)
+    tid = await asyncio.to_thread(_insert_trade_sync, payload, user_id, trade_status)
     logger.info(
-        "Paper trade #%d OPEN %s qty=%d entry=%.2f stop=%.2f target=%.2f t2=%.2f risk=₹%.0f sl_mode=%s user=%s",
-        tid, symbol.upper(), qty, entry_price, stop_loss, target_price,
-        target2_price or 0.0, risk_rupees, payload["sl_mode"], user_id,
+        "Paper trade #%d %s %s qty=%d entry=%.2f (mkt=%.2f) stop=%.2f target=%.2f risk=₹%.0f sl_mode=%s user=%s",
+        tid, trade_status, symbol.upper(), qty, entry_price,
+        current_price or 0.0, stop_loss, target_price, risk_rupees, payload["sl_mode"], user_id,
     )
     return await asyncio.to_thread(_fetch_trade_sync, tid)
 
