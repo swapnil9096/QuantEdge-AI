@@ -663,7 +663,7 @@ export function PaperTradingPanel({ refreshToken }) {
 
         {portfolio?.market_status && <MarketStatusBanner market={portfolio.market_status} />}
 
-        {settings && (
+        {settings && (<>
           <div
             style={{
               display: 'flex',
@@ -741,8 +741,6 @@ export function PaperTradingPanel({ refreshToken }) {
               {settings.max_open_positions} open · Hold ≤ {settings.max_hold_days}d
             </div>
           </div>
-
-          {/* TSL + Partial Exit settings row */}
           <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 14, fontSize: 12, marginTop: 6 }}>
             <label style={{ display: 'flex', alignItems: 'center', gap: 6, color: C.sub }}>
               SL Mode
@@ -779,7 +777,7 @@ export function PaperTradingPanel({ refreshToken }) {
               Partial exits ({settings.partial_exit_ratio || 50}% at T1)
             </label>
           </div>
-        )}
+        </>)}
 
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, marginBottom: 14 }}>
           <KpiCard icon={<CircleDollarSign size={14} />} label="Equity" value={fmtMoney(cap.total_equity)} sub={`Start ${fmtMoney(cap.starting)}`} color={C.teal} />
