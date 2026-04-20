@@ -1410,7 +1410,7 @@ BT_MIN_AVG_RETURN = 2.0         # percent
 BT_FORWARD_DAYS = 20
 BT_HISTORY_DAYS = 750           # ~3y
 
-COMBINED_MIN_SCORE = 90
+COMBINED_MIN_SCORE = 70
 COMBINED_WEIGHTS = {
     "technical": 40,
     "fundamentals": 25,
@@ -2856,7 +2856,7 @@ _paper_settings: dict[str, Any] = {
     "telegram_on_close": True,
     "telegram_on_error": True,
     "telegram_on_high_probability": True,
-    "telegram_high_probability_threshold": 85,
+    "telegram_high_probability_threshold": 70,
     "telegram_daily_summary": False,
 }
 
@@ -3275,9 +3275,9 @@ def _init_user_schema() -> None:
             """
             CREATE TABLE IF NOT EXISTS user_paper_settings (
                 user_id                          INTEGER PRIMARY KEY,
-                auto_trade_enabled               INTEGER NOT NULL DEFAULT 0,
-                auto_trade_threshold             REAL    NOT NULL DEFAULT 90.0,
-                auto_trade_market_open_only      INTEGER NOT NULL DEFAULT 1,
+                auto_trade_enabled               INTEGER NOT NULL DEFAULT 1,
+                auto_trade_threshold             REAL    NOT NULL DEFAULT 70.0,
+                auto_trade_market_open_only      INTEGER NOT NULL DEFAULT 0,
                 starting_capital                 REAL    NOT NULL DEFAULT 1000000,
                 risk_per_trade_pct               REAL    NOT NULL DEFAULT 1.0,
                 max_open_positions               INTEGER NOT NULL DEFAULT 5,
@@ -3286,7 +3286,7 @@ def _init_user_schema() -> None:
                 telegram_on_close                INTEGER NOT NULL DEFAULT 1,
                 telegram_on_error                INTEGER NOT NULL DEFAULT 1,
                 telegram_on_high_probability     INTEGER NOT NULL DEFAULT 1,
-                telegram_high_probability_threshold INTEGER NOT NULL DEFAULT 85,
+                telegram_high_probability_threshold INTEGER NOT NULL DEFAULT 70,
                 telegram_daily_summary           INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             )
@@ -3917,9 +3917,9 @@ def _paper_settings_update(updates: dict[str, Any]) -> dict[str, Any]:
 
 
 _PAPER_SETTINGS_DEFAULTS: dict[str, Any] = {
-    "auto_trade_enabled": False,
-    "auto_trade_threshold": 90.0,
-    "auto_trade_market_open_only": True,
+    "auto_trade_enabled": True,
+    "auto_trade_threshold": 70.0,
+    "auto_trade_market_open_only": False,
     "starting_capital": 1_000_000.0,
     "risk_per_trade_pct": 1.0,
     "max_open_positions": 5,
@@ -3928,7 +3928,7 @@ _PAPER_SETTINGS_DEFAULTS: dict[str, Any] = {
     "telegram_on_close": True,
     "telegram_on_error": True,
     "telegram_on_high_probability": True,
-    "telegram_high_probability_threshold": 85,
+    "telegram_high_probability_threshold": 70,
     "telegram_daily_summary": False,
     "sl_mode": "fixed",
     "atr_multiplier": 1.5,
