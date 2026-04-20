@@ -2647,12 +2647,12 @@ def _init_history_schema() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_history_high_prob ON deep_analysis_history(high_probability)"
         )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_history_user ON deep_analysis_history(user_id)"
-        )
         existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(deep_analysis_history)")}
         if existing_cols and "user_id" not in existing_cols:
             conn.execute("ALTER TABLE deep_analysis_history ADD COLUMN user_id INTEGER REFERENCES users(id)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_history_user ON deep_analysis_history(user_id)"
+        )
 
 
 _init_history_schema()
