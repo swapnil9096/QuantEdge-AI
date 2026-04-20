@@ -5124,23 +5124,77 @@ class PaperSettingsUpdate(BaseModel):
 async def paper_portfolio(user: dict = Depends(get_current_user)) -> dict[str, Any]:
     uid = user["user_id"]
     settings = _get_user_paper_settings(uid)
+    starting_capital = float(settings["starting_capital"])
+    realised = await asyncio.to_thread(_sum_realized_pnl_sync, uid)
+    equity = starting_capital + realised
+
     open_trades = await asyncio.to_thread(_list_trades_sync, "OPEN", None, 200, uid)
-    closed_trades = await asyncio.to_thread(_list_trades_sync, "CLOSED", None, 500, uid)
-    equity = _user_paper_capital(uid)
-    total_open_pnl = sum(
-        (t.get("last_price", t["entry_price"]) - t["entry_price"]) * t["quantity"]
-        for t in open_trades
-    )
-    closed_pnl = _sum_realized_pnl_sync(uid)
+    unrealised = 0.0
+    marked_positions: list[dict[str, Any]] = []
+    for t in open_trades:
+        sym = t["symbol"]
+        current = t.get("last_price") or t["entry_price"]
+        try:
+            data = await asyncio.to_thread(_fetch_live_stock_data, sym, t.get("exchange", "NSE"))
+            current = float(data["price"])
+            await asyncio.to_thread(_mark_trade_price_sync, int(t["id"]), current)
+            t["last_price"] = current
+            t["last_marked_at"] = _now_iso()
+        except Exception as exc:
+            logger.debug("Mark-to-market failed for %s: %s", sym, exc)
+        entry = float(t["entry_price"])
+        qty = int(t["quantity"])
+        unrealised_trade = (float(current) - entry) * qty
+        t["unrealised_pnl"] = round(unrealised_trade, 2)
+        t["unrealised_pnl_pct"] = round((float(current) - entry) / entry * 100, 2) if entry else 0.0
+        unrealised += unrealised_trade
+        marked_positions.append(t)
+
+    with _db_connect() as conn:
+        stats_row = conn.execute(
+            """
+            SELECT
+              COUNT(*) AS n_closed,
+              SUM(CASE WHEN pnl_amount > 0 THEN 1 ELSE 0 END) AS n_wins,
+              SUM(CASE WHEN pnl_amount <= 0 THEN 1 ELSE 0 END) AS n_losses,
+              AVG(pnl_pct) AS avg_pnl_pct,
+              MIN(pnl_pct) AS worst_pct,
+              MAX(pnl_pct) AS best_pct
+            FROM paper_trades
+            WHERE status = 'CLOSED' AND user_id = ?
+            """,
+            (uid,),
+        ).fetchone()
+
+    n_closed = int(stats_row["n_closed"] or 0)
+    n_wins = int(stats_row["n_wins"] or 0)
+    n_losses = int(stats_row["n_losses"] or 0)
+    win_rate = round(n_wins / n_closed * 100, 2) if n_closed else 0.0
+
     return {
-        "open_positions": open_trades,
-        "closed_trades_count": len(closed_trades),
-        "open_count": len(open_trades),
-        "realized_pnl": closed_pnl,
-        "unrealized_pnl": total_open_pnl,
-        "equity": equity,
-        "starting_capital": settings["starting_capital"],
         "settings": settings,
+        "market_status": get_market_status(),
+        "capital": {
+            "starting": starting_capital,
+            "realised_pnl": round(realised, 2),
+            "unrealised_pnl": round(unrealised, 2),
+            "total_equity": round(equity + unrealised, 2),
+            "equity_ex_open": round(equity, 2),
+        },
+        "positions": {
+            "open_count": len(marked_positions),
+            "max_open": int(settings["max_open_positions"]),
+            "open": marked_positions,
+        },
+        "stats": {
+            "closed_count": n_closed,
+            "wins": n_wins,
+            "losses": n_losses,
+            "win_rate": win_rate,
+            "avg_pnl_pct": round(float(stats_row["avg_pnl_pct"] or 0), 2),
+            "best_pct": round(float(stats_row["best_pct"] or 0), 2),
+            "worst_pct": round(float(stats_row["worst_pct"] or 0), 2),
+        },
     }
 
 
