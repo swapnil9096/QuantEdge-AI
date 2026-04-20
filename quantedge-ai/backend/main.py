@@ -2627,7 +2627,8 @@ def _init_history_schema() -> None:
                 expected_return  REAL,
                 pattern_detected TEXT,
                 rsi              REAL,
-                payload          TEXT    NOT NULL
+                payload          TEXT    NOT NULL,
+                user_id          INTEGER REFERENCES users(id)
             )
             """
         )
@@ -2640,12 +2641,18 @@ def _init_history_schema() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_history_high_prob ON deep_analysis_history(high_probability)"
         )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_history_user ON deep_analysis_history(user_id)"
+        )
+        existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(deep_analysis_history)")}
+        if existing_cols and "user_id" not in existing_cols:
+            conn.execute("ALTER TABLE deep_analysis_history ADD COLUMN user_id INTEGER REFERENCES users(id)")
 
 
 _init_history_schema()
 
 
-def _history_save_sync(payload: dict[str, Any]) -> int:
+def _history_save_sync(payload: dict[str, Any], user_id: Optional[int] = None) -> int:
     """Insert a single deep-analyze result; return the new row id."""
     symbol = payload.get("symbol", "").upper()
     overall = payload.get("overall", {}) or {}
@@ -2677,6 +2684,7 @@ def _history_save_sync(payload: dict[str, Any]) -> int:
         patterns.get("name") or "None",
         indicators.get("rsi"),
         json.dumps(payload, default=str),
+        user_id,
     )
     with _db_lock, _db_connect() as conn:
         cursor = conn.execute(
@@ -2686,16 +2694,16 @@ def _history_save_sync(payload: dict[str, Any]) -> int:
                 combined_score, min_score, high_probability, all_gates_passed,
                 technical_score, fundamentals_score, backtest_score, risk_reward_score,
                 entry_price, stop_loss, target_1, target_2, risk_reward, expected_return,
-                pattern_detected, rsi, payload
-            ) VALUES (?,?,?,?,?, ?,?,?,?, ?,?,?,?, ?,?,?,?,?,?, ?,?,?)
+                pattern_detected, rsi, payload, user_id
+            ) VALUES (?,?,?,?,?, ?,?,?,?, ?,?,?,?, ?,?,?,?,?,?, ?,?,?,?)
             """,
             row,
         )
         return int(cursor.lastrowid or 0)
 
 
-async def save_history(payload: dict[str, Any]) -> int:
-    return await asyncio.to_thread(_history_save_sync, payload)
+async def save_history(payload: dict[str, Any], user_id: Optional[int] = None) -> int:
+    return await asyncio.to_thread(_history_save_sync, payload, user_id)
 
 
 def _history_list_sync(
@@ -2703,11 +2711,15 @@ def _history_list_sync(
     offset: int = 0,
     symbol: Optional[str] = None,
     high_probability_only: bool = False,
+    user_id: Optional[int] = None,
 ) -> dict[str, Any]:
     limit = max(1, min(int(limit), 500))
     offset = max(0, int(offset))
     clauses: list[str] = []
     params: list[Any] = []
+    if user_id is not None:
+        clauses.append("user_id = ?")
+        params.append(user_id)
     if symbol:
         clauses.append("symbol = ?")
         params.append(symbol.strip().upper())
@@ -2746,11 +2758,16 @@ def _history_list_sync(
     return {"total": total, "limit": limit, "offset": offset, "items": items}
 
 
-def _history_get_sync(item_id: int) -> Optional[dict[str, Any]]:
+def _history_get_sync(item_id: int, user_id: Optional[int] = None) -> Optional[dict[str, Any]]:
     with _db_connect() as conn:
-        row = conn.execute(
-            "SELECT * FROM deep_analysis_history WHERE id = ?", (int(item_id),)
-        ).fetchone()
+        if user_id is not None:
+            row = conn.execute(
+                "SELECT * FROM deep_analysis_history WHERE id = ? AND user_id = ?", (int(item_id), user_id)
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM deep_analysis_history WHERE id = ?", (int(item_id),)
+            ).fetchone()
     if row is None:
         return None
     payload_json = row["payload"]
@@ -2770,22 +2787,31 @@ def _history_get_sync(item_id: int) -> Optional[dict[str, Any]]:
     }
 
 
-def _history_delete_sync(item_id: int) -> bool:
+def _history_delete_sync(item_id: int, user_id: Optional[int] = None) -> bool:
     with _db_lock, _db_connect() as conn:
-        cursor = conn.execute(
-            "DELETE FROM deep_analysis_history WHERE id = ?", (int(item_id),)
-        )
+        if user_id is not None:
+            cursor = conn.execute(
+                "DELETE FROM deep_analysis_history WHERE id = ? AND user_id = ?", (int(item_id), user_id)
+            )
+        else:
+            cursor = conn.execute(
+                "DELETE FROM deep_analysis_history WHERE id = ?", (int(item_id),)
+            )
         return cursor.rowcount > 0
 
 
-def _history_clear_sync(symbol: Optional[str] = None) -> int:
+def _history_clear_sync(symbol: Optional[str] = None, user_id: Optional[int] = None) -> int:
     with _db_lock, _db_connect() as conn:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if user_id is not None:
+            clauses.append("user_id = ?")
+            params.append(user_id)
         if symbol:
-            cursor = conn.execute(
-                "DELETE FROM deep_analysis_history WHERE symbol = ?", (symbol.upper(),)
-            )
-        else:
-            cursor = conn.execute("DELETE FROM deep_analysis_history")
+            clauses.append("symbol = ?")
+            params.append(symbol.upper())
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        cursor = conn.execute(f"DELETE FROM deep_analysis_history {where}", params)
         return int(cursor.rowcount)
 
 
@@ -3366,26 +3392,33 @@ def _init_paper_schema() -> None:
 _init_paper_schema()
 
 
-def _migrate_orphaned_trades() -> None:
-    """Assign trades with user_id=NULL to the first registered user."""
+def _migrate_orphaned_records() -> None:
+    """Assign trades and history with user_id=NULL to the first registered user."""
     with _db_lock, _db_connect() as conn:
-        orphaned = conn.execute(
-            "SELECT COUNT(*) AS n FROM paper_trades WHERE user_id IS NULL"
-        ).fetchone()
-        if not orphaned or int(orphaned["n"]) == 0:
-            return
         first_user = conn.execute(
             "SELECT id FROM users ORDER BY id ASC LIMIT 1"
         ).fetchone()
         if not first_user:
             return
         uid = int(first_user["id"])
-        conn.execute("UPDATE paper_trades SET user_id = ? WHERE user_id IS NULL", (uid,))
-        logger.info("Migrated %d orphaned paper trades to user_id=%d", int(orphaned["n"]), uid)
+
+        trades = conn.execute(
+            "SELECT COUNT(*) AS n FROM paper_trades WHERE user_id IS NULL"
+        ).fetchone()
+        if trades and int(trades["n"]) > 0:
+            conn.execute("UPDATE paper_trades SET user_id = ? WHERE user_id IS NULL", (uid,))
+            logger.info("Migrated %d orphaned paper trades to user_id=%d", int(trades["n"]), uid)
+
+        history = conn.execute(
+            "SELECT COUNT(*) AS n FROM deep_analysis_history WHERE user_id IS NULL"
+        ).fetchone()
+        if history and int(history["n"]) > 0:
+            conn.execute("UPDATE deep_analysis_history SET user_id = ? WHERE user_id IS NULL", (uid,))
+            logger.info("Migrated %d orphaned history entries to user_id=%d", int(history["n"]), uid)
 
 
 try:
-    _migrate_orphaned_trades()
+    _migrate_orphaned_records()
 except Exception:
     pass
 
@@ -4359,25 +4392,31 @@ async def _stop_background_tasks() -> None:
                 pass
 
 
-def _history_stats_sync() -> dict[str, Any]:
+def _history_stats_sync(user_id: Optional[int] = None) -> dict[str, Any]:
+    user_clause = "WHERE user_id = ?" if user_id is not None else ""
+    user_params: list[Any] = [user_id] if user_id is not None else []
     with _db_connect() as conn:
         row = conn.execute(
-            """
+            f"""
             SELECT COUNT(*) AS total,
                    SUM(CASE WHEN high_probability = 1 THEN 1 ELSE 0 END) AS winners,
                    MAX(analyzed_at) AS last_analyzed_at,
                    AVG(combined_score) AS avg_score
             FROM deep_analysis_history
-            """
+            {user_clause}
+            """,
+            user_params,
         ).fetchone()
         top = conn.execute(
-            """
+            f"""
             SELECT symbol, COUNT(*) AS n
             FROM deep_analysis_history
+            {user_clause}
             GROUP BY symbol
             ORDER BY n DESC
             LIMIT 5
-            """
+            """,
+            user_params,
         ).fetchall()
     return {
         "total": int(row["total"] or 0),
@@ -5017,7 +5056,7 @@ async def deep_analyze_endpoint(
     history_id: Optional[int] = None
     if save:
         try:
-            history_id = await save_history(result)
+            history_id = await save_history(result, user_id=user["user_id"])
             result = {**result, "history_id": history_id}
         except Exception as exc:
             logger.warning("Saving deep-analysis history failed for %s: %s", symbol, exc)
@@ -5374,6 +5413,7 @@ async def list_deep_analysis_history(
     offset: int = 0,
     symbol: Optional[str] = None,
     high_probability_only: bool = False,
+    user: dict = Depends(get_current_user),
 ) -> dict[str, Any]:
     """List persisted deep-analysis runs, newest first.
 
@@ -5384,34 +5424,34 @@ async def list_deep_analysis_history(
       * `high_probability_only` — only return runs flagged high_probability
     """
     return await asyncio.to_thread(
-        _history_list_sync, limit, offset, symbol, high_probability_only
+        _history_list_sync, limit, offset, symbol, high_probability_only, user["user_id"]
     )
 
 
 @app.get("/deep-analysis-history/stats")
-async def deep_analysis_history_stats() -> dict[str, Any]:
-    return await asyncio.to_thread(_history_stats_sync)
+async def deep_analysis_history_stats(user: dict = Depends(get_current_user)) -> dict[str, Any]:
+    return await asyncio.to_thread(_history_stats_sync, user["user_id"])
 
 
 @app.get("/deep-analysis-history/{item_id}")
-async def get_deep_analysis_history(item_id: int) -> dict[str, Any]:
-    item = await asyncio.to_thread(_history_get_sync, item_id)
+async def get_deep_analysis_history(item_id: int, user: dict = Depends(get_current_user)) -> dict[str, Any]:
+    item = await asyncio.to_thread(_history_get_sync, item_id, user["user_id"])
     if item is None:
         raise HTTPException(status_code=404, detail=f"History entry {item_id} not found.")
     return item
 
 
 @app.delete("/deep-analysis-history/{item_id}")
-async def delete_deep_analysis_history(item_id: int) -> dict[str, Any]:
-    deleted = await asyncio.to_thread(_history_delete_sync, item_id)
+async def delete_deep_analysis_history(item_id: int, user: dict = Depends(get_current_user)) -> dict[str, Any]:
+    deleted = await asyncio.to_thread(_history_delete_sync, item_id, user["user_id"])
     if not deleted:
         raise HTTPException(status_code=404, detail=f"History entry {item_id} not found.")
     return {"deleted": True, "id": item_id}
 
 
 @app.delete("/deep-analysis-history")
-async def clear_deep_analysis_history(symbol: Optional[str] = None) -> dict[str, Any]:
-    removed = await asyncio.to_thread(_history_clear_sync, symbol)
+async def clear_deep_analysis_history(symbol: Optional[str] = None, user: dict = Depends(get_current_user)) -> dict[str, Any]:
+    removed = await asyncio.to_thread(_history_clear_sync, symbol, user["user_id"])
     return {"deleted": removed, "symbol": symbol}
 
 
