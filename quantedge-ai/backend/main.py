@@ -433,6 +433,8 @@ def _reload_secret_globals(d: dict[str, str]) -> None:
     POLYGON_API_KEY = _val("POLYGON_API_KEY")
     OPENAI_API_KEY = _val("OPENAI_API_KEY")
     ANTHROPIC_API_KEY = _val("ANTHROPIC_API_KEY")
+    global _claude_backoff_until
+    _claude_backoff_until = 0.0
     PORTKEY_API_KEY = _val("PORTKEY_API_KEY")
     PORTKEY_VIRTUAL_KEY = _val("PORTKEY_VIRTUAL_KEY")
     PORTKEY_CONFIG = _val("PORTKEY_CONFIG")
@@ -1122,13 +1124,26 @@ def hard_conditions(
 # Claude narrative (replaces GPT-4o)
 # ---------------------------------------------------------------------------
 
+_claude_backoff_until: float = 0.0
+_CLAUDE_BACKOFF_SECONDS = 300
+
 
 async def generate_gpt_analysis(context: dict[str, Any]) -> str:
-    """Generate trade narrative using Claude API (falls back to heuristic)."""
-    if not ANTHROPIC_API_KEY:
+    """Generate trade narrative using Claude API via _build_claude_route (Portkey / direct)."""
+    global _claude_backoff_until
+
+    has_any_key = ANTHROPIC_API_KEY or PORTKEY_API_KEY
+    if not has_any_key:
         return _heuristic_narrative(context)
+
+    import time as _time
+    if _time.monotonic() < _claude_backoff_until:
+        return _heuristic_narrative(context)
+
     try:
         import httpx
+
+        url, headers, mode = _build_claude_route()
 
         system_prompt = (
             "You are a senior quantitative trader at a long/short equity desk. "
@@ -1145,21 +1160,26 @@ async def generate_gpt_analysis(context: dict[str, Any]) -> str:
             "system": system_prompt,
             "messages": [{"role": "user", "content": _format_context(context)}],
         }
-        headers = {
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        }
         async with httpx.AsyncClient(timeout=20.0) as client:
-            resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                json=payload,
-                headers=headers,
-            )
+            resp = await client.post(url, json=payload, headers=headers)
+            if resp.status_code == 401:
+                logger.error(
+                    "Claude narrative 401 via %s — credentials invalid or expired. "
+                    "Backing off for %ds.",
+                    mode, _CLAUDE_BACKOFF_SECONDS,
+                )
+                _claude_backoff_until = _time.monotonic() + _CLAUDE_BACKOFF_SECONDS
+                return _heuristic_narrative(context)
+            if resp.status_code == 429:
+                logger.warning("Claude narrative rate-limited (429) via %s, falling back", mode)
+                _claude_backoff_until = _time.monotonic() + 60
+                return _heuristic_narrative(context)
             resp.raise_for_status()
             data = resp.json()
             text = (data.get("content") or [{}])[0].get("text", "").strip()
             return text or _heuristic_narrative(context)
+    except HTTPException:
+        return _heuristic_narrative(context)
     except Exception as exc:
         logger.warning("Claude narrative failed: %s", exc)
         return _heuristic_narrative(context)
@@ -1578,7 +1598,18 @@ def _fetch_yahoo_fundamentals_sync(yahoo_symbol: str) -> dict[str, Any]:
     """
     import yfinance as yf
 
-    ticker = yf.Ticker(yahoo_symbol)
+    for _crumb_attempt in range(_YF_MAX_RETRIES):
+        try:
+            ticker = yf.Ticker(yahoo_symbol)
+            _ = ticker.fast_info
+            break
+        except Exception as exc:
+            if _is_crumb_error(exc) and _crumb_attempt < _YF_MAX_RETRIES - 1:
+                logger.info("yfinance crumb error (fundamentals) for %s, clearing cache", yahoo_symbol)
+                _yf_clear_cache()
+                continue
+            ticker = yf.Ticker(yahoo_symbol)
+            break
 
     # ---- Step 1: fast_info (reliable even under rate limiting) ----------------
     fast_market_cap: Optional[float] = None
@@ -2354,13 +2385,21 @@ async def _fetch_long_ohlcv(symbol: str, years: int = 3) -> Optional[pd.DataFram
     def _fetch() -> Optional[pd.DataFrame]:
         import yfinance as yf
 
-        t = yf.Ticker(yahoo_symbol)
-        h = t.history(period=f"{years}y", interval="1d", auto_adjust=False)
-        if h is None or h.empty:
-            return None
-        h = h.rename(columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
-        h = h[["open", "high", "low", "close", "volume"]].astype(float).dropna()
-        return h.reset_index(drop=True) if len(h) else None
+        for attempt in range(_YF_MAX_RETRIES):
+            try:
+                t = yf.Ticker(yahoo_symbol)
+                h = t.history(period=f"{years}y", interval="1d", auto_adjust=False)
+                if h is None or h.empty:
+                    return None
+                h = h.rename(columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
+                h = h[["open", "high", "low", "close", "volume"]].astype(float).dropna()
+                return h.reset_index(drop=True) if len(h) else None
+            except Exception as exc:
+                if _is_crumb_error(exc) and attempt < _YF_MAX_RETRIES - 1:
+                    logger.info("yfinance crumb error for %s, clearing cache and retrying", yahoo_symbol)
+                    _yf_clear_cache()
+                    continue
+                raise
 
     try:
         return await asyncio.to_thread(_fetch)
@@ -3327,6 +3366,30 @@ def _init_paper_schema() -> None:
 _init_paper_schema()
 
 
+def _migrate_orphaned_trades() -> None:
+    """Assign trades with user_id=NULL to the first registered user."""
+    with _db_lock, _db_connect() as conn:
+        orphaned = conn.execute(
+            "SELECT COUNT(*) AS n FROM paper_trades WHERE user_id IS NULL"
+        ).fetchone()
+        if not orphaned or int(orphaned["n"]) == 0:
+            return
+        first_user = conn.execute(
+            "SELECT id FROM users ORDER BY id ASC LIMIT 1"
+        ).fetchone()
+        if not first_user:
+            return
+        uid = int(first_user["id"])
+        conn.execute("UPDATE paper_trades SET user_id = ? WHERE user_id IS NULL", (uid,))
+        logger.info("Migrated %d orphaned paper trades to user_id=%d", int(orphaned["n"]), uid)
+
+
+try:
+    _migrate_orphaned_trades()
+except Exception:
+    pass
+
+
 # ---------------------------------------------------------------------------
 # ML Training schema
 # ---------------------------------------------------------------------------
@@ -3861,13 +3924,14 @@ async def maybe_auto_paper_trade(
     symbol: str,
     analysis: dict[str, Any],
     history_id: Optional[int] = None,
+    user_id: Optional[int] = None,
 ) -> tuple[Optional[dict[str, Any]], dict[str, Any]]:
     """If settings allow, open a paper trade from a Deep Analyze result.
 
     Returns (trade_or_none, meta) where meta always carries the reason so the
     frontend can show a helpful banner ("Market closed", "Below threshold", ...).
     """
-    settings = _paper_settings_snapshot()
+    settings = _get_user_paper_settings(user_id) if user_id else _paper_settings_snapshot()
     market = get_market_status()
     overall = analysis.get("overall") or {}
     score = int(overall.get("combined_score", 0) or 0)
@@ -3916,6 +3980,7 @@ async def maybe_auto_paper_trade(
             float(entry),
             float(stop),
             float(target),
+            user_id=user_id,
             source=effective_source,
             history_id=history_id,
             combined_score=score,
@@ -4170,13 +4235,23 @@ async def _price_poll_loop() -> None:
             try:
                 import yfinance as yf
                 tickers_str = " ".join(s + ".NS" for s in symbols)
-                data = yf.download(
-                    tickers_str,
-                    period="1d",
-                    interval="1m",
-                    progress=False,
-                    auto_adjust=True,
-                )
+                data = pd.DataFrame()
+                for _attempt in range(_YF_MAX_RETRIES):
+                    try:
+                        data = yf.download(
+                            tickers_str,
+                            period="5d",
+                            interval="1m",
+                            progress=False,
+                            auto_adjust=True,
+                        )
+                        break
+                    except Exception as dl_exc:
+                        if _is_crumb_error(dl_exc) and _attempt < _YF_MAX_RETRIES - 1:
+                            logger.info("yfinance crumb error in poll, clearing cache and retrying")
+                            _yf_clear_cache()
+                            continue
+                        raise
                 ts = datetime.now(timezone.utc).isoformat()
                 if data.empty:
                     continue
@@ -4701,10 +4776,34 @@ async def proxy_claude(req: ClaudeProxyRequest) -> dict[str, Any]:
 _stock_data_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _stock_data_cache_ttl = 60  # seconds
 
+_YF_MAX_RETRIES = 2
+
+
+def _yf_clear_cache() -> None:
+    """Clear yfinance's internal cookie/crumb cache to recover from 401 errors."""
+    try:
+        import yfinance as yf
+        if hasattr(yf, "cache") and hasattr(yf.cache, "get_cache"):
+            yf.cache.get_cache().clear()
+        for attr in ("_cookie", "_crumb", "_cookie_strategy"):
+            if hasattr(yf.utils, attr):
+                try:
+                    delattr(yf.utils, attr)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _is_crumb_error(exc: Exception) -> bool:
+    """Check if the exception is a Yahoo crumb/auth failure worth retrying."""
+    msg = str(exc).lower()
+    return "401" in msg or "crumb" in msg or "unauthorized" in msg
+
 
 def _normalize_yahoo_symbol(symbol: str, exchange: str) -> str:
     """Map a user-friendly symbol + exchange to Yahoo's format."""
-    sym = symbol.strip().upper()
+    sym = symbol.strip().upper().lstrip("$")
     if "." in sym:
         return sym  # already qualified (RELIANCE.NS / AAPL)
     if exchange.upper() == "BSE":
@@ -4760,12 +4859,23 @@ def _derive_sentiment_label(change_pct: float) -> str:
 
 def _fetch_live_stock_data(symbol: str, exchange: str) -> dict[str, Any]:
     """Synchronous yfinance fetch. Called via asyncio.to_thread from the route."""
-    import yfinance as yf  # local import so the backend still starts if yfinance is missing
+    import yfinance as yf
 
     yahoo_symbol = _normalize_yahoo_symbol(symbol, exchange)
-    ticker = yf.Ticker(yahoo_symbol)
 
-    history = ticker.history(period="1y", interval="1d", auto_adjust=False)
+    history = None
+    for attempt in range(_YF_MAX_RETRIES):
+        try:
+            ticker = yf.Ticker(yahoo_symbol)
+            history = ticker.history(period="1y", interval="1d", auto_adjust=False)
+            break
+        except Exception as exc:
+            if _is_crumb_error(exc) and attempt < _YF_MAX_RETRIES - 1:
+                logger.info("yfinance crumb error for %s, clearing cache and retrying", yahoo_symbol)
+                _yf_clear_cache()
+                continue
+            raise
+
     if history is None or history.empty:
         raise HTTPException(
             status_code=404,
@@ -4891,6 +5001,7 @@ async def deep_analyze_endpoint(
     symbol: str,
     exchange: str = "NSE",
     save: bool = True,
+    user: dict = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Multi-factor deep analysis of a single symbol.
 
@@ -4917,7 +5028,7 @@ async def deep_analyze_endpoint(
 
     # Auto paper-trade hook: opens a trade if settings allow and score ≥ threshold.
     try:
-        auto_trade, auto_meta = await maybe_auto_paper_trade(symbol, result, history_id=history_id)
+        auto_trade, auto_meta = await maybe_auto_paper_trade(symbol, result, history_id=history_id, user_id=user["user_id"])
         result = {
             **result,
             "auto_paper_trade": auto_trade,
