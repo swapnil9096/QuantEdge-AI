@@ -278,6 +278,8 @@ _API_PATH_PREFIXES: tuple[str, ...] = (
     "/broker/",
     "/broker",
     "/train-ml",
+    "/dashboard/",
+    "/news/",
     "/ws/",
     "/docs",
     "/openapi.json",
@@ -3290,6 +3292,18 @@ def _init_user_schema() -> None:
             )
             """
         )
+        # Migrate user_paper_settings — add TSL + partial exit columns
+        ups_cols = {row[1] for row in conn.execute("PRAGMA table_info(user_paper_settings)")}
+        for col, typedef in [
+            ("sl_mode", "TEXT NOT NULL DEFAULT 'fixed'"),
+            ("atr_multiplier", "REAL NOT NULL DEFAULT 1.5"),
+            ("trailing_activation_pct", "REAL NOT NULL DEFAULT 1.0"),
+            ("partial_exit_enabled", "INTEGER NOT NULL DEFAULT 0"),
+            ("partial_exit_ratio", "REAL NOT NULL DEFAULT 50.0"),
+        ]:
+            if ups_cols and col not in ups_cols:
+                conn.execute(f"ALTER TABLE user_paper_settings ADD COLUMN {col} {typedef}")
+
         # Add user_id column to paper_trades if missing (safe migration).
         # Guard with `existing_cols` so we skip on a fresh DB where the table
         # doesn't exist yet — _init_paper_schema() creates it right after.
@@ -3391,6 +3405,23 @@ def _init_paper_schema() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_paper_orders_trade ON paper_orders(trade_id)"
         )
+        # Migrate paper_trades — add TSL + partial exit columns
+        pt_cols = {row[1] for row in conn.execute("PRAGMA table_info(paper_trades)")}
+        for col, typedef in [
+            ("sl_mode", "TEXT NOT NULL DEFAULT 'fixed'"),
+            ("highest_price", "REAL"),
+            ("trailing_sl", "REAL"),
+            ("trailing_activated", "INTEGER NOT NULL DEFAULT 0"),
+            ("original_stop", "REAL"),
+            ("atr_at_entry", "REAL"),
+            ("partial_exit_done", "INTEGER NOT NULL DEFAULT 0"),
+            ("partial_exit_qty", "INTEGER"),
+            ("partial_exit_price", "REAL"),
+            ("target2_price", "REAL"),
+            ("remaining_qty", "INTEGER"),
+        ]:
+            if pt_cols and col not in pt_cols:
+                conn.execute(f"ALTER TABLE paper_trades ADD COLUMN {col} {typedef}")
 
 
 _init_paper_schema()
@@ -3492,6 +3523,17 @@ _init_broker_schema()
 def _row_to_trade_dict(row: sqlite3.Row) -> dict[str, Any]:
     d = dict(row)
     d["status"] = d["status"].upper()
+    d.setdefault("sl_mode", "fixed")
+    d.setdefault("highest_price", None)
+    d.setdefault("trailing_sl", None)
+    d.setdefault("trailing_activated", 0)
+    d.setdefault("original_stop", d.get("stop_loss"))
+    d.setdefault("atr_at_entry", None)
+    d.setdefault("partial_exit_done", 0)
+    d.setdefault("partial_exit_qty", None)
+    d.setdefault("partial_exit_price", None)
+    d.setdefault("target2_price", None)
+    d.setdefault("remaining_qty", d.get("quantity"))
     return d
 
 
@@ -3619,23 +3661,27 @@ def _fetch_trade_sync(trade_id: int, user_id: Optional[int] = None) -> Optional[
 def _insert_trade_sync(trade: dict[str, Any], user_id: Optional[int] = None, status: str = "OPEN") -> int:
     """Insert a trade. OPEN trades get an immediate BUY order; PENDING trades wait for entry fill."""
     now = trade.get("opened_at") or _now_iso()
+    entry = float(trade["entry_price"])
+    qty = int(trade["quantity"])
     with _db_lock, _db_connect() as conn:
         cursor = conn.execute(
             """
             INSERT INTO paper_trades (
                 symbol, exchange, status, entry_price, stop_loss, target_price,
                 quantity, risk_amount, opened_at, max_hold_days, source,
-                history_id, combined_score, notes, last_price, last_marked_at, user_id
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                history_id, combined_score, notes, last_price, last_marked_at, user_id,
+                sl_mode, highest_price, original_stop, atr_at_entry,
+                target2_price, remaining_qty
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, ?,?,?,?, ?,?)
             """,
             (
                 trade["symbol"].upper(),
                 trade.get("exchange", "NSE"),
                 status,
-                float(trade["entry_price"]),
+                entry,
                 float(trade["stop_loss"]),
                 float(trade["target_price"]),
-                int(trade["quantity"]),
+                qty,
                 float(trade["risk_amount"]),
                 now,
                 int(trade.get("max_hold_days", PAPER_MAX_HOLD_DAYS)),
@@ -3643,9 +3689,15 @@ def _insert_trade_sync(trade: dict[str, Any], user_id: Optional[int] = None, sta
                 trade.get("history_id"),
                 trade.get("combined_score"),
                 trade.get("notes"),
-                float(trade["entry_price"]),
+                entry,
                 now,
                 user_id,
+                trade.get("sl_mode", "fixed"),
+                entry,
+                float(trade["stop_loss"]),
+                trade.get("atr_at_entry"),
+                trade.get("target2_price"),
+                qty,
             ),
         )
         tid = int(cursor.lastrowid or 0)
@@ -3655,7 +3707,7 @@ def _insert_trade_sync(trade: dict[str, Any], user_id: Optional[int] = None, sta
                 INSERT INTO paper_orders (trade_id, side, reason, price, quantity, executed_at)
                 VALUES (?,?,?,?,?,?)
                 """,
-                (tid, "BUY", "OPEN", float(trade["entry_price"]), int(trade["quantity"]), now),
+                (tid, "BUY", "OPEN", entry, qty, now),
             )
     return tid
 
@@ -3675,8 +3727,12 @@ def _close_trade_sync(
             return None
         entry = float(row["entry_price"])
         qty = int(row["quantity"])
-        pnl = (float(close_price) - entry) * qty
-        pnl_pct = (float(close_price) - entry) / entry * 100 if entry else 0.0
+        remaining = int(row["remaining_qty"]) if row["remaining_qty"] is not None else qty
+        partial_booked = 0.0
+        if row["partial_exit_done"] and row["partial_exit_qty"] and row["partial_exit_price"]:
+            partial_booked = (float(row["partial_exit_price"]) - entry) * int(row["partial_exit_qty"])
+        pnl = (float(close_price) - entry) * remaining + partial_booked
+        pnl_pct = pnl / (entry * qty) * 100 if entry and qty else 0.0
         conn.execute(
             """
             UPDATE paper_trades
@@ -3706,7 +3762,7 @@ def _close_trade_sync(
             INSERT INTO paper_orders (trade_id, side, reason, price, quantity, executed_at)
             VALUES (?,?,?,?,?,?)
             """,
-            (int(trade_id), "SELL", exit_reason, float(close_price), qty, closed_at),
+            (int(trade_id), "SELL", exit_reason, float(close_price), remaining, closed_at),
         )
     return _fetch_trade_sync(trade_id)
 
@@ -3745,6 +3801,54 @@ def _activate_pending_trade_sync(trade_id: int, fill_price: float) -> Optional[d
             (int(trade_id), "BUY", "OPEN", float(fill_price), int(row["quantity"]), now),
         )
     return _fetch_trade_sync(trade_id)
+
+
+def _update_trailing_sl_sync(
+    trade_id: int, highest: float, trailing_sl: float, activated: bool
+) -> None:
+    with _db_lock, _db_connect() as conn:
+        conn.execute(
+            """UPDATE paper_trades
+               SET highest_price=?, trailing_sl=?, trailing_activated=?, stop_loss=?
+               WHERE id=? AND status='OPEN'""",
+            (float(highest), float(trailing_sl), 1 if activated else 0,
+             float(trailing_sl), int(trade_id)),
+        )
+
+
+def _partial_close_trade_sync(
+    trade_id: int, close_price: float, partial_qty: int, exit_reason: str = "PARTIAL_TARGET"
+) -> Optional[dict[str, Any]]:
+    """Sell a portion of the position, move SL to entry (cost-to-cost)."""
+    now = _now_iso()
+    with _db_lock, _db_connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM paper_trades WHERE id = ? AND status = 'OPEN'", (int(trade_id),)
+        ).fetchone()
+        if row is None:
+            return None
+        entry = float(row["entry_price"])
+        current_remaining = int(row.get("remaining_qty") or row["quantity"])
+        sell_qty = min(partial_qty, current_remaining)
+        new_remaining = current_remaining - sell_qty
+        conn.execute(
+            "INSERT INTO paper_orders (trade_id, side, reason, price, quantity, executed_at) VALUES (?,?,?,?,?,?)",
+            (int(trade_id), "SELL", exit_reason, float(close_price), sell_qty, now),
+        )
+        conn.execute(
+            """UPDATE paper_trades
+               SET partial_exit_done=1, partial_exit_qty=?, partial_exit_price=?,
+                   remaining_qty=?, stop_loss=?, original_stop=COALESCE(original_stop, stop_loss),
+                   last_price=?, last_marked_at=?
+               WHERE id=?""",
+            (sell_qty, float(close_price), new_remaining,
+             entry, float(close_price), now, int(trade_id)),
+        )
+    return _fetch_trade_sync(trade_id)
+
+
+EXIT_PARTIAL = "PARTIAL_TARGET"
+EXIT_TARGET2 = "TARGET2_HIT"
 
 
 # ---- Sizing --------------------------------------------------------------
@@ -3826,6 +3930,11 @@ _PAPER_SETTINGS_DEFAULTS: dict[str, Any] = {
     "telegram_on_high_probability": True,
     "telegram_high_probability_threshold": 85,
     "telegram_daily_summary": False,
+    "sl_mode": "fixed",
+    "atr_multiplier": 1.5,
+    "trailing_activation_pct": 1.0,
+    "partial_exit_enabled": False,
+    "partial_exit_ratio": 50.0,
 }
 
 
@@ -3843,16 +3952,23 @@ def _get_user_paper_settings(user_id: int) -> dict[str, Any]:
             )
         return dict(_PAPER_SETTINGS_DEFAULTS)
     settings = dict(_PAPER_SETTINGS_DEFAULTS)
+    _bool_keys = {
+        "auto_trade_enabled", "auto_trade_market_open_only",
+        "telegram_on_open", "telegram_on_close", "telegram_on_error",
+        "telegram_on_high_probability", "telegram_daily_summary",
+        "partial_exit_enabled",
+    }
+    _int_keys = {"max_open_positions", "max_hold_days", "telegram_high_probability_threshold"}
+    _str_keys = {"sl_mode"}
     for k in settings:
         col_val = row[k] if k in row.keys() else None
         if col_val is not None:
-            if k in {"auto_trade_enabled", "auto_trade_market_open_only",
-                     "telegram_on_open", "telegram_on_close", "telegram_on_error",
-                     "telegram_on_high_probability", "telegram_daily_summary"}:
+            if k in _bool_keys:
                 settings[k] = bool(col_val)
-            elif k in {"max_open_positions", "max_hold_days",
-                       "telegram_high_probability_threshold"}:
+            elif k in _int_keys:
                 settings[k] = int(col_val)
+            elif k in _str_keys:
+                settings[k] = str(col_val)
             else:
                 settings[k] = float(col_val)
     return settings
@@ -3863,12 +3979,17 @@ def _update_user_paper_settings(user_id: int, updates: dict[str, Any]) -> dict[s
         "auto_trade_enabled", "auto_trade_market_open_only",
         "telegram_on_open", "telegram_on_close", "telegram_on_error",
         "telegram_on_high_probability", "telegram_daily_summary",
+        "partial_exit_enabled",
     }
     allowed_int = {
         "max_open_positions", "max_hold_days", "telegram_high_probability_threshold",
     }
-    allowed_float = {"risk_per_trade_pct", "starting_capital", "auto_trade_threshold"}
-    allowed = allowed_bool | allowed_int | allowed_float
+    allowed_float = {
+        "risk_per_trade_pct", "starting_capital", "auto_trade_threshold",
+        "atr_multiplier", "trailing_activation_pct", "partial_exit_ratio",
+    }
+    allowed_str = {"sl_mode"}
+    allowed = allowed_bool | allowed_int | allowed_float | allowed_str
 
     # Ensure row exists
     with _db_lock, _db_connect() as conn:
@@ -3882,6 +4003,8 @@ def _update_user_paper_settings(user_id: int, updates: dict[str, Any]) -> dict[s
                 v = 1 if v else 0
             elif k in allowed_int:
                 v = int(v)
+            elif k in allowed_str:
+                v = str(v)
             else:
                 v = float(v)
             conn.execute(
@@ -3919,6 +4042,8 @@ async def open_paper_trade(
     combined_score: Optional[int] = None,
     exchange: str = "NSE",
     notes: Optional[str] = None,
+    atr_at_entry: Optional[float] = None,
+    target2_price: Optional[float] = None,
 ) -> dict[str, Any]:
     settings = _get_user_paper_settings(user_id) if user_id else _paper_settings_snapshot()
 
@@ -3952,6 +4077,8 @@ async def open_paper_trade(
             "Computed quantity is zero — risk too small or stop too far. Check levels."
         )
 
+    effective_atr = atr_at_entry or max((entry_price - stop_loss) / 1.5, entry_price * 0.005)
+
     payload = {
         "symbol": symbol,
         "exchange": exchange,
@@ -3965,11 +4092,15 @@ async def open_paper_trade(
         "combined_score": combined_score,
         "notes": notes,
         "opened_at": _now_iso(),
+        "sl_mode": settings.get("sl_mode", "fixed"),
+        "atr_at_entry": effective_atr,
+        "target2_price": target2_price,
     }
     tid = await asyncio.to_thread(_insert_trade_sync, payload, user_id)
     logger.info(
-        "Paper trade #%d OPEN %s qty=%d entry=%.2f stop=%.2f target=%.2f risk=₹%.0f source=%s user=%s",
-        tid, symbol.upper(), qty, entry_price, stop_loss, target_price, risk_rupees, source, user_id,
+        "Paper trade #%d OPEN %s qty=%d entry=%.2f stop=%.2f target=%.2f t2=%.2f risk=₹%.0f sl_mode=%s user=%s",
+        tid, symbol.upper(), qty, entry_price, stop_loss, target_price,
+        target2_price or 0.0, risk_rupees, payload["sl_mode"], user_id,
     )
     return await asyncio.to_thread(_fetch_trade_sync, tid)
 
@@ -4080,6 +4211,8 @@ async def maybe_auto_paper_trade(
             history_id=history_id,
             combined_score=score,
             notes=" | ".join(note_parts),
+            atr_at_entry=float(levels.get("atr") or 0) or None,
+            target2_price=float(levels.get("target_2") or 0) or None,
         )
         meta["reason"] = (
             "Auto-trade opened."
@@ -4222,16 +4355,16 @@ async def _monitor_open_positions_once() -> dict[str, Any]:
             await asyncio.to_thread(_cancel_pending_trade_sync, int(t["id"]))
             logger.info("PENDING trade #%d %s cancelled — exceeded max hold days", t["id"], sym)
 
-    # --- Phase 2: check OPEN trades for stop/target/time exit ---
+    # --- Phase 2: check OPEN trades for TSL update + stop/target/time exit ---
     open_trades = await asyncio.to_thread(_list_trades_sync, "OPEN", None, 500)
+    partial_exits = 0
     for t in open_trades:
         sym = t["symbol"]
         try:
             data = await asyncio.to_thread(_fetch_live_stock_data, sym, t.get("exchange", "NSE"))
-            _telegram_failure_counts[sym] = 0  # reset on success
+            _telegram_failure_counts[sym] = 0
         except Exception as exc:
             logger.debug("Monitor fetch failed for %s: %s", sym, exc)
-            # Alert after 3 consecutive failures for the same symbol.
             _telegram_failure_counts[sym] = _telegram_failure_counts.get(sym, 0) + 1
             if _telegram_failure_counts[sym] >= 3:
                 try:
@@ -4244,20 +4377,74 @@ async def _monitor_open_positions_once() -> dict[str, Any]:
         price = float(data["price"])
         await asyncio.to_thread(_mark_trade_price_sync, int(t["id"]), price)
 
+        entry = float(t["entry_price"])
         stop = float(t["stop_loss"])
         target = float(t["target_price"])
 
-        # Intraday SL/TARGET evaluation only when the NSE regular session is live.
-        # Outside market hours the "live" price is the last session close — evaluating
-        # stops/targets against a stale bar produces false exits, especially on aftermarket-opened trades.
+        # --- Trailing Stop Loss logic ---
+        sl_mode = t.get("sl_mode", "fixed")
+        if sl_mode in ("trailing", "hybrid") and market_is_open:
+            highest = float(t.get("highest_price") or entry)
+            atr = float(t.get("atr_at_entry") or max((entry - float(t.get("original_stop") or stop)) / 1.5, entry * 0.005))
+            multiplier = float(settings.get("atr_multiplier", 1.5))
+            activation_pct = float(settings.get("trailing_activation_pct", 1.0))
+            trailing_active = bool(t.get("trailing_activated", 0))
+
+            if price > highest:
+                highest = price
+
+            if sl_mode == "trailing":
+                trailing_active = True
+            elif sl_mode == "hybrid":
+                profit_pct = (price - entry) / entry * 100
+                if profit_pct >= activation_pct:
+                    trailing_active = True
+
+            if trailing_active:
+                new_tsl = highest - (atr * multiplier)
+                original = float(t.get("original_stop") or stop)
+                effective_stop = max(new_tsl, original)
+                await asyncio.to_thread(
+                    _update_trailing_sl_sync, int(t["id"]), highest, effective_stop, True
+                )
+                stop = effective_stop
+            else:
+                if price > highest:
+                    await asyncio.to_thread(_mark_trade_price_sync, int(t["id"]), price)
+
         if market_is_open:
-            hit_stop = price <= stop
-            hit_target = price >= target
-            if hit_stop:
+            # --- Stop loss check ---
+            if price <= stop:
                 await close_paper_trade(int(t["id"]), price=stop, reason=EXIT_SL)
                 closed += 1
                 continue
-            if hit_target:
+
+            # --- Partial target exit logic ---
+            partial_done = bool(t.get("partial_exit_done", 0))
+            partial_enabled = bool(settings.get("partial_exit_enabled", False))
+            target2 = t.get("target2_price")
+
+            if partial_enabled and not partial_done and price >= target:
+                ratio = float(settings.get("partial_exit_ratio", 50.0)) / 100.0
+                remaining = int(t.get("remaining_qty") or t["quantity"])
+                sell_qty = max(1, int(remaining * ratio))
+                result = await asyncio.to_thread(
+                    _partial_close_trade_sync, int(t["id"]), target, sell_qty, EXIT_PARTIAL
+                )
+                if result:
+                    partial_exits += 1
+                    logger.info(
+                        "Partial exit #%d %s: sold %d @ %.2f, remaining %d, SL→entry",
+                        t["id"], sym, sell_qty, target, remaining - sell_qty,
+                    )
+                continue
+
+            if partial_done and target2 and price >= float(target2):
+                await close_paper_trade(int(t["id"]), price=float(target2), reason=EXIT_TARGET2)
+                closed += 1
+                continue
+
+            if not partial_enabled and price >= target:
                 await close_paper_trade(int(t["id"]), price=target, reason=EXIT_TARGET)
                 closed += 1
                 continue
@@ -4275,6 +4462,7 @@ async def _monitor_open_positions_once() -> dict[str, Any]:
     return {
         "closed": closed,
         "evaluated": len(open_trades),
+        "partial_exits": partial_exits,
         "pending_evaluated": len(pending_trades),
         "activated": activated,
         "market_status": market["status"],
@@ -5213,6 +5401,192 @@ class PaperSettingsUpdate(BaseModel):
     telegram_on_high_probability: Optional[bool] = None
     telegram_high_probability_threshold: Optional[int] = Field(default=None, ge=0, le=100)
     telegram_daily_summary: Optional[bool] = None
+    sl_mode: Optional[str] = Field(default=None, pattern=r"^(fixed|trailing|hybrid)$")
+    atr_multiplier: Optional[float] = Field(default=None, gt=0, le=10)
+    trailing_activation_pct: Optional[float] = Field(default=None, ge=0, le=50)
+    partial_exit_enabled: Optional[bool] = None
+    partial_exit_ratio: Optional[float] = Field(default=None, gt=0, le=100)
+
+
+# ---------------------------------------------------------------------------
+# Dashboard summary
+# ---------------------------------------------------------------------------
+
+
+def _dashboard_summary_sync(user_id: int) -> dict[str, Any]:
+    settings = _get_user_paper_settings(user_id)
+    starting_capital = float(settings["starting_capital"])
+
+    with _db_connect() as conn:
+        realised_row = conn.execute(
+            "SELECT COALESCE(SUM(pnl_amount), 0) AS total FROM paper_trades WHERE status='CLOSED' AND user_id=?",
+            (user_id,),
+        ).fetchone()
+        realised = float(realised_row["total"])
+
+        open_count = int(conn.execute(
+            "SELECT COUNT(*) AS n FROM paper_trades WHERE status='OPEN' AND user_id=?", (user_id,)
+        ).fetchone()["n"])
+        pending_count = int(conn.execute(
+            "SELECT COUNT(*) AS n FROM paper_trades WHERE status='PENDING' AND user_id=?", (user_id,)
+        ).fetchone()["n"])
+
+        today_str = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
+        todays_pnl = float(conn.execute(
+            "SELECT COALESCE(SUM(pnl_amount), 0) AS t FROM paper_trades WHERE status='CLOSED' AND user_id=? AND closed_at LIKE ?",
+            (user_id, f"{today_str}%"),
+        ).fetchone()["t"])
+
+        stats_row = conn.execute(
+            """SELECT
+                 COUNT(*) AS n_closed,
+                 SUM(CASE WHEN pnl_amount > 0 THEN 1 ELSE 0 END) AS n_wins,
+                 AVG(pnl_pct) AS avg_pnl_pct,
+                 MIN(pnl_amount) AS worst_amt, MAX(pnl_amount) AS best_amt,
+                 MIN(pnl_pct) AS worst_pct, MAX(pnl_pct) AS best_pct
+               FROM (
+                 SELECT pnl_amount, pnl_pct FROM paper_trades
+                 WHERE status='CLOSED' AND user_id=?
+                 ORDER BY closed_at DESC LIMIT 50
+               )""",
+            (user_id,),
+        ).fetchone()
+
+        equity_rows = conn.execute(
+            "SELECT pnl_amount FROM paper_trades WHERE status='CLOSED' AND user_id=? ORDER BY closed_at ASC",
+            (user_id,),
+        ).fetchall()
+
+        open_trades = conn.execute(
+            "SELECT entry_price, last_price, quantity, remaining_qty FROM paper_trades WHERE status='OPEN' AND user_id=?",
+            (user_id,),
+        ).fetchall()
+
+    peak = starting_capital
+    max_dd = 0.0
+    equity = starting_capital
+    for row in equity_rows:
+        equity += float(row["pnl_amount"] or 0)
+        if equity > peak:
+            peak = equity
+        dd = (equity - peak) / peak * 100 if peak > 0 else 0
+        if dd < max_dd:
+            max_dd = dd
+
+    unrealised = sum(
+        (float(t["last_price"] or t["entry_price"]) - float(t["entry_price"])) * int(t["remaining_qty"] or t["quantity"])
+        for t in open_trades
+    )
+    total_equity = starting_capital + realised + unrealised
+
+    n_closed = int(stats_row["n_closed"] or 0)
+    n_wins = int(stats_row["n_wins"] or 0)
+    win_rate = round(n_wins / n_closed * 100, 2) if n_closed else 0.0
+
+    return {
+        "totalEquity": round(total_equity, 2),
+        "startingCapital": starting_capital,
+        "realisedPnL": round(realised, 2),
+        "unrealisedPnL": round(unrealised, 2),
+        "todaysPnL": round(todays_pnl, 2),
+        "todaysPnLPct": round(todays_pnl / starting_capital * 100, 2) if starting_capital else 0.0,
+        "openPositionsCount": open_count,
+        "pendingOrdersCount": pending_count,
+        "closedTradesCount": n_closed,
+        "winRate": win_rate,
+        "avgReturnPct": round(float(stats_row["avg_pnl_pct"] or 0), 2),
+        "bestTrade": round(float(stats_row["best_amt"] or 0), 2),
+        "worstTrade": round(float(stats_row["worst_amt"] or 0), 2),
+        "bestTradePct": round(float(stats_row["best_pct"] or 0), 2),
+        "worstTradePct": round(float(stats_row["worst_pct"] or 0), 2),
+        "maxDrawdownPct": round(max_dd, 2),
+        "settings": settings,
+    }
+
+
+@app.get("/dashboard/summary")
+async def dashboard_summary(user: dict = Depends(get_current_user)) -> dict[str, Any]:
+    return await asyncio.to_thread(_dashboard_summary_sync, user["user_id"])
+
+
+# ---------------------------------------------------------------------------
+# News / Sentiment scoring
+# ---------------------------------------------------------------------------
+
+_POSITIVE_WORDS = {
+    "surge", "rally", "bullish", "upgrade", "beat", "profit", "growth",
+    "breakout", "outperform", "strong", "record", "high", "gain", "buy",
+    "expand", "momentum", "dividend", "recovery", "turnaround", "positive",
+}
+_NEGATIVE_WORDS = {
+    "crash", "fall", "bearish", "downgrade", "miss", "loss", "decline",
+    "selloff", "underperform", "weak", "low", "risk", "sell", "warning",
+    "fraud", "debt", "default", "negative", "concern", "investigation",
+}
+
+_sentiment_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+_SENTIMENT_CACHE_TTL = 300
+
+
+def _score_headline(headline: str) -> float:
+    words = set(headline.lower().split())
+    pos = len(words & _POSITIVE_WORDS)
+    neg = len(words & _NEGATIVE_WORDS)
+    total = pos + neg
+    if total == 0:
+        return 0.0
+    return round((pos - neg) / total, 2)
+
+
+def _fetch_news_sentiment_sync(symbol: str) -> dict[str, Any]:
+    try:
+        import feedparser
+    except ImportError:
+        return {"symbol": symbol.upper(), "sentiment_score": 0, "sentiment_label": "Neutral",
+                "article_count": 0, "activity_spike": False, "articles": [], "error": "feedparser not installed"}
+
+    query = f"{symbol} stock NSE"
+    url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
+    feed = feedparser.parse(url)
+    articles = []
+    scores = []
+    for entry in feed.entries[:15]:
+        title = entry.get("title", "")
+        score = _score_headline(title)
+        scores.append(score)
+        articles.append({
+            "title": title,
+            "published": entry.get("published", ""),
+            "link": entry.get("link", ""),
+            "sentiment_score": score,
+        })
+
+    avg_score = round(sum(scores) / len(scores), 3) if scores else 0.0
+    activity_spike = len(articles) >= 8
+    label = "Bullish" if avg_score > 0.15 else ("Bearish" if avg_score < -0.15 else "Neutral")
+
+    return {
+        "symbol": symbol.upper(),
+        "sentiment_score": avg_score,
+        "sentiment_label": label,
+        "article_count": len(articles),
+        "activity_spike": activity_spike,
+        "articles": articles,
+    }
+
+
+@app.get("/news/sentiment")
+async def news_sentiment(symbol: str, user: dict = Depends(get_current_user)) -> dict[str, Any]:
+    cache_key = symbol.upper()
+    cached = _cache_get(_sentiment_cache, cache_key, _SENTIMENT_CACHE_TTL)
+    if cached is not None:
+        return cached
+    try:
+        result = await asyncio.to_thread(_fetch_news_sentiment_sync, symbol)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"News fetch failed: {exc}") from exc
+    _cache_set(_sentiment_cache, cache_key, result)
+    return result
 
 
 @app.get("/paper-portfolio")

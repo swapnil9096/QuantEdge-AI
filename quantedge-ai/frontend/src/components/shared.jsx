@@ -407,3 +407,21 @@ export function GateCard({ title, icon, gate }) {
     </div>
   );
 }
+
+
+export function SentimentBadge({ label, score }) {
+  const bg = label === 'Bullish' ? 'rgba(74,222,128,0.12)'
+    : label === 'Bearish' ? 'rgba(248,113,113,0.08)'
+    : 'rgba(148,163,184,0.1)';
+  const color = label === 'Bullish' ? C.green
+    : label === 'Bearish' ? C.red : C.muted;
+  return (
+    <span style={{
+      padding: '2px 8px', borderRadius: 999, background: bg,
+      color, border: `1px solid ${color}`,
+      fontSize: 10.5, fontWeight: 700, letterSpacing: 0.4,
+    }}>
+      {label} {score != null ? `(${score > 0 ? '+' : ''}${score})` : ''}
+    </span>
+  );
+}

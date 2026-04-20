@@ -741,6 +741,44 @@ export function PaperTradingPanel({ refreshToken }) {
               {settings.max_open_positions} open · Hold ≤ {settings.max_hold_days}d
             </div>
           </div>
+
+          {/* TSL + Partial Exit settings row */}
+          <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 14, fontSize: 12, marginTop: 6 }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 6, color: C.sub }}>
+              SL Mode
+              <select
+                value={settings.sl_mode || 'fixed'}
+                onChange={async (e) => {
+                  try { setSettings(await patchPaperSettings({ sl_mode: e.target.value })); } catch {}
+                }}
+                style={{
+                  background: C.dark, color: C.text, border: `1px solid ${C.border}`,
+                  borderRadius: 6, padding: '2px 6px', fontSize: 11, fontFamily: FONT_MONO,
+                }}
+              >
+                <option value="fixed">Fixed</option>
+                <option value="trailing">Trailing</option>
+                <option value="hybrid">Hybrid</option>
+              </select>
+            </label>
+            {settings.sl_mode !== 'fixed' && (
+              <span style={{ color: C.muted, fontSize: 10.5, fontFamily: FONT_MONO }}>
+                ATR×{settings.atr_multiplier || 1.5}
+                {settings.sl_mode === 'hybrid' ? ` · activate @+${settings.trailing_activation_pct || 1}%` : ''}
+              </span>
+            )}
+            <label style={{ display: 'flex', alignItems: 'center', gap: 4, color: settings.partial_exit_enabled ? C.teal : C.sub, cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={!!settings.partial_exit_enabled}
+                onChange={async (e) => {
+                  try { setSettings(await patchPaperSettings({ partial_exit_enabled: e.target.checked })); } catch {}
+                }}
+                style={{ accentColor: C.teal }}
+              />
+              Partial exits ({settings.partial_exit_ratio || 50}% at T1)
+            </label>
+          </div>
         )}
 
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, marginBottom: 14 }}>
@@ -804,8 +842,21 @@ export function PaperTradingPanel({ refreshToken }) {
                         </span>
                       ) : '—'}
                     </td>
-                    <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: C.red }}>₹{fmt(t.stop_loss)}</td>
-                    <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: C.green }}>₹{fmt(t.target_price)}</td>
+                    <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: C.red }}>
+                      ₹{fmt(t.stop_loss)}
+                      {t.sl_mode !== 'fixed' && t.trailing_activated ? (
+                        <span style={{ fontSize: 9, color: C.yellow, marginLeft: 3 }}>TSL</span>
+                      ) : null}
+                      {t.partial_exit_done ? (
+                        <span style={{ fontSize: 9, color: C.teal, marginLeft: 3 }}>C2C</span>
+                      ) : null}
+                    </td>
+                    <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: C.green }}>
+                      ₹{fmt(t.target_price)}
+                      {t.partial_exit_done && t.target2_price ? (
+                        <span style={{ fontSize: 9, color: C.muted, marginLeft: 3 }}>T2: ₹{fmt(t.target2_price)}</span>
+                      ) : null}
+                    </td>
                     <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: pnlColor }}>{fmtMoney(t.unrealised_pnl)}</td>
                     <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: pnlColor }}>
                       {t.unrealised_pnl_pct != null ? fmtPct(t.unrealised_pnl_pct) : '—'}

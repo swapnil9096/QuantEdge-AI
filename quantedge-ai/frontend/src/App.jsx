@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useEffect } from 'react';
 import {
-  Brain, Building2, Cpu, LineChart as LineIcon,
+  BarChart3, Brain, Building2, Cpu, LineChart as LineIcon,
   Rocket, Search,
 } from 'lucide-react';
 import { C, API_BASE, TOKEN_KEY } from './constants.js';
@@ -12,6 +12,7 @@ import { MLTab } from './components/MLTab.jsx';
 import { InsightsTab } from './components/InsightsTab.jsx';
 import { AlphaScanTab } from './components/AlphaScanTab.jsx';
 import { BrokerPanel } from './components/BrokerPanel.jsx';
+import { DashboardTab } from './components/DashboardTab.jsx';
 import { AuthScreen } from './components/AuthScreen.jsx';
 import { WelcomeModal } from './components/WelcomeModal.jsx';
 import { useWebSocket } from './hooks/useWebSocket.js';
@@ -27,6 +28,7 @@ import { parseSymbol, computeSetup } from './utils/indicators.js';
 // ---------------------------------------------------------------------------
 
 const TABS = [
+  { id: 'dashboard', label: 'Dashboard',   icon: <BarChart3 size={14} /> },
   { id: 'scanner',   label: 'Scanner',     icon: <Search size={14} /> },
   { id: 'backtest',  label: 'Backtest',    icon: <LineIcon size={14} /> },
   { id: 'ml',        label: 'ML Models',   icon: <Cpu size={14} /> },
@@ -41,7 +43,7 @@ const TABS = [
 
 export default function App() {
   // ---- Tab -----------------------------------------------------------------
-  const [activeTab, setActiveTab] = useState('scanner');
+  const [activeTab, setActiveTab] = useState('dashboard');
 
   // ---- Scanner state -------------------------------------------------------
   const [watchlist, setWatchlist] = useState(['RELIANCE', 'TCS', 'HDFCBANK', 'INFY', 'ICICIBANK']);
@@ -328,6 +330,7 @@ export default function App() {
       </nav>
 
       <main style={{ padding: '1.25rem 1.5rem 4rem', maxWidth: 1400, margin: '0 auto' }}>
+        {activeTab === 'dashboard' && <DashboardTab />}
         {activeTab === 'scanner' && (
           <ScannerTab
             watchlist={watchlist}

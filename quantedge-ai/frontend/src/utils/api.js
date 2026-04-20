@@ -421,6 +421,22 @@ export async function runMonitorNow() {
 }
 
 // ---------------------------------------------------------------------------
+// Dashboard & Sentiment
+// ---------------------------------------------------------------------------
+
+export async function fetchDashboardSummary() {
+  const r = await fetch(`${API_BASE}/dashboard/summary`);
+  if (!r.ok) throw new Error(`dashboard/summary ${r.status}`);
+  return r.json();
+}
+
+export async function fetchNewsSentiment(symbol) {
+  const r = await fetch(`${API_BASE}/news/sentiment?symbol=${encodeURIComponent(symbol)}`);
+  if (!r.ok) throw new Error(`news/sentiment ${r.status}`);
+  return r.json();
+}
+
+// ---------------------------------------------------------------------------
 // Telegram
 // ---------------------------------------------------------------------------
 
