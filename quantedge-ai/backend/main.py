@@ -3506,6 +3506,22 @@ def _fetch_open_trade_for_symbol_sync(symbol: str, user_id: Optional[int] = None
     return _row_to_trade_dict(row) if row else None
 
 
+def _fetch_active_trade_for_symbol_sync(symbol: str, user_id: Optional[int] = None) -> Optional[dict[str, Any]]:
+    """Find any OPEN or PENDING trade for a symbol (dedup guard)."""
+    with _db_connect() as conn:
+        if user_id is not None:
+            row = conn.execute(
+                "SELECT * FROM paper_trades WHERE symbol=? AND status IN ('OPEN','PENDING') AND user_id=? ORDER BY id DESC LIMIT 1",
+                (symbol.upper(), user_id),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM paper_trades WHERE symbol=? AND status IN ('OPEN','PENDING') ORDER BY id DESC LIMIT 1",
+                (symbol.upper(),),
+            ).fetchone()
+    return _row_to_trade_dict(row) if row else None
+
+
 def _count_open_positions_sync(user_id: Optional[int] = None) -> int:
     with _db_connect() as conn:
         if user_id is not None:
@@ -3514,6 +3530,18 @@ def _count_open_positions_sync(user_id: Optional[int] = None) -> int:
             ).fetchone()
         else:
             row = conn.execute("SELECT COUNT(*) AS n FROM paper_trades WHERE status='OPEN'").fetchone()
+    return int(row["n"] if row else 0)
+
+
+def _count_active_positions_sync(user_id: Optional[int] = None) -> int:
+    """Count OPEN + PENDING trades (both occupy a slot)."""
+    with _db_connect() as conn:
+        if user_id is not None:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM paper_trades WHERE status IN ('OPEN','PENDING') AND user_id=?", (user_id,)
+            ).fetchone()
+        else:
+            row = conn.execute("SELECT COUNT(*) AS n FROM paper_trades WHERE status IN ('OPEN','PENDING')").fetchone()
     return int(row["n"] if row else 0)
 
 
@@ -3584,8 +3612,9 @@ def _fetch_trade_sync(trade_id: int, user_id: Optional[int] = None) -> Optional[
     return trade
 
 
-def _insert_trade_sync(trade: dict[str, Any], user_id: Optional[int] = None) -> int:
-    """Insert an OPEN trade and its BUY order atomically."""
+def _insert_trade_sync(trade: dict[str, Any], user_id: Optional[int] = None, status: str = "OPEN") -> int:
+    """Insert a trade. OPEN trades get an immediate BUY order; PENDING trades wait for entry fill."""
+    now = trade.get("opened_at") or _now_iso()
     with _db_lock, _db_connect() as conn:
         cursor = conn.execute(
             """
@@ -3598,31 +3627,32 @@ def _insert_trade_sync(trade: dict[str, Any], user_id: Optional[int] = None) -> 
             (
                 trade["symbol"].upper(),
                 trade.get("exchange", "NSE"),
-                "OPEN",
+                status,
                 float(trade["entry_price"]),
                 float(trade["stop_loss"]),
                 float(trade["target_price"]),
                 int(trade["quantity"]),
                 float(trade["risk_amount"]),
-                trade.get("opened_at") or _now_iso(),
+                now,
                 int(trade.get("max_hold_days", PAPER_MAX_HOLD_DAYS)),
                 trade.get("source", "manual"),
                 trade.get("history_id"),
                 trade.get("combined_score"),
                 trade.get("notes"),
                 float(trade["entry_price"]),
-                trade.get("opened_at") or _now_iso(),
+                now,
                 user_id,
             ),
         )
         tid = int(cursor.lastrowid or 0)
-        conn.execute(
-            """
-            INSERT INTO paper_orders (trade_id, side, reason, price, quantity, executed_at)
-            VALUES (?,?,?,?,?,?)
-            """,
-            (tid, "BUY", "OPEN", float(trade["entry_price"]), int(trade["quantity"]), trade.get("opened_at") or _now_iso()),
-        )
+        if status == "OPEN":
+            conn.execute(
+                """
+                INSERT INTO paper_orders (trade_id, side, reason, price, quantity, executed_at)
+                VALUES (?,?,?,?,?,?)
+                """,
+                (tid, "BUY", "OPEN", float(trade["entry_price"]), int(trade["quantity"]), now),
+            )
     return tid
 
 
@@ -3680,9 +3710,37 @@ def _close_trade_sync(
 def _mark_trade_price_sync(trade_id: int, price: float) -> None:
     with _db_lock, _db_connect() as conn:
         conn.execute(
-            "UPDATE paper_trades SET last_price=?, last_marked_at=? WHERE id=? AND status='OPEN'",
+            "UPDATE paper_trades SET last_price=?, last_marked_at=? WHERE id=? AND status IN ('OPEN','PENDING')",
             (float(price), _now_iso(), int(trade_id)),
         )
+
+
+def _cancel_pending_trade_sync(trade_id: int) -> None:
+    with _db_lock, _db_connect() as conn:
+        conn.execute(
+            "UPDATE paper_trades SET status='CANCELLED' WHERE id=? AND status='PENDING'",
+            (int(trade_id),),
+        )
+
+
+def _activate_pending_trade_sync(trade_id: int, fill_price: float) -> Optional[dict[str, Any]]:
+    """Convert a PENDING trade to OPEN and create the BUY order at fill_price."""
+    now = _now_iso()
+    with _db_lock, _db_connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM paper_trades WHERE id=? AND status='PENDING'", (int(trade_id),)
+        ).fetchone()
+        if row is None:
+            return None
+        conn.execute(
+            "UPDATE paper_trades SET status='OPEN', opened_at=?, last_price=?, last_marked_at=? WHERE id=?",
+            (now, float(fill_price), now, int(trade_id)),
+        )
+        conn.execute(
+            "INSERT INTO paper_orders (trade_id, side, reason, price, quantity, executed_at) VALUES (?,?,?,?,?,?)",
+            (int(trade_id), "BUY", "OPEN", float(fill_price), int(row["quantity"]), now),
+        )
+    return _fetch_trade_sync(trade_id)
 
 
 # ---- Sizing --------------------------------------------------------------
@@ -3866,14 +3924,14 @@ async def open_paper_trade(
             "Invalid levels: require stop_loss < entry_price < target_price."
         )
 
-    # Dedup — one OPEN position per symbol per user.
-    existing = await asyncio.to_thread(_fetch_open_trade_for_symbol_sync, symbol.upper(), user_id)
+    # Dedup — one OPEN or PENDING position per symbol per user.
+    existing = await asyncio.to_thread(_fetch_active_trade_for_symbol_sync, symbol.upper(), user_id)
     if existing:
         raise PaperTradeError(
-            f"An open position for {symbol.upper()} already exists (#{existing['id']})."
+            f"An {'open' if existing['status'] == 'OPEN' else 'pending'} position for {symbol.upper()} already exists (#{existing['id']})."
         )
 
-    open_count = await asyncio.to_thread(_count_open_positions_sync, user_id)
+    open_count = await asyncio.to_thread(_count_active_positions_sync, user_id)
     if open_count >= settings["max_open_positions"]:
         raise PaperTradeError(
             f"Max open positions reached ({open_count}/{settings['max_open_positions']})."
@@ -3890,6 +3948,17 @@ async def open_paper_trade(
             "Computed quantity is zero — risk too small or stop too far. Check levels."
         )
 
+    # Determine if we can fill immediately or must pend as a limit order.
+    current_price: Optional[float] = None
+    try:
+        live = await asyncio.to_thread(_fetch_live_stock_data, symbol, exchange)
+        current_price = float(live["price"])
+    except Exception:
+        pass
+
+    fill_now = current_price is not None and current_price <= entry_price
+    trade_status = "OPEN" if fill_now else "PENDING"
+
     payload = {
         "symbol": symbol,
         "exchange": exchange,
@@ -3904,10 +3973,11 @@ async def open_paper_trade(
         "notes": notes,
         "opened_at": _now_iso(),
     }
-    tid = await asyncio.to_thread(_insert_trade_sync, payload, user_id)
+    tid = await asyncio.to_thread(_insert_trade_sync, payload, user_id, trade_status)
     logger.info(
-        "Paper trade #%d OPEN %s qty=%d entry=%.2f stop=%.2f target=%.2f risk=₹%.0f source=%s user=%s",
-        tid, symbol.upper(), qty, entry_price, stop_loss, target_price, risk_rupees, source, user_id,
+        "Paper trade #%d %s %s qty=%d entry=%.2f (mkt=%.2f) stop=%.2f target=%.2f risk=₹%.0f source=%s user=%s",
+        tid, trade_status, symbol.upper(), qty, entry_price,
+        current_price or 0.0, stop_loss, target_price, risk_rupees, source, user_id,
     )
     return await asyncio.to_thread(_fetch_trade_sync, tid)
 
@@ -4123,14 +4193,45 @@ async def paper_portfolio_snapshot() -> dict[str, Any]:
 
 
 async def _monitor_open_positions_once() -> dict[str, Any]:
-    """Evaluate exits for every OPEN position. Returns {closed, skipped_market_closed, market_status}."""
-    open_trades = await asyncio.to_thread(_list_trades_sync, "OPEN", None, 500)
-    closed = 0
-    settings = _paper_settings_snapshot()
-    max_hold = int(settings["max_hold_days"])
+    """Evaluate pending fills and exits for all active positions."""
     market = get_market_status()
     market_is_open = bool(market["is_open"])
+    settings = _paper_settings_snapshot()
+    max_hold = int(settings["max_hold_days"])
+    activated = 0
+    closed = 0
 
+    # --- Phase 1: check PENDING trades for entry fill ---
+    pending_trades = await asyncio.to_thread(_list_trades_sync, "PENDING", None, 500)
+    for t in pending_trades:
+        sym = t["symbol"]
+        try:
+            data = await asyncio.to_thread(_fetch_live_stock_data, sym, t.get("exchange", "NSE"))
+        except Exception:
+            continue
+        price = float(data["price"])
+        await asyncio.to_thread(_mark_trade_price_sync, int(t["id"]), price)
+        entry = float(t["entry_price"])
+        if market_is_open and price <= entry:
+            result = await asyncio.to_thread(_activate_pending_trade_sync, int(t["id"]), entry)
+            if result:
+                activated += 1
+                logger.info("PENDING trade #%d %s filled at entry %.2f (mkt=%.2f)", t["id"], sym, entry, price)
+                try:
+                    asyncio.create_task(telegram_send_trade_opened(result))
+                except Exception:
+                    pass
+        # Cancel stale pending orders
+        try:
+            created = datetime.fromisoformat(t["opened_at"].replace("Z", "+00:00"))
+        except Exception:
+            created = datetime.now(timezone.utc)
+        if (datetime.now(timezone.utc) - created).days >= max_hold:
+            await asyncio.to_thread(_cancel_pending_trade_sync, int(t["id"]))
+            logger.info("PENDING trade #%d %s cancelled — exceeded max hold days", t["id"], sym)
+
+    # --- Phase 2: check OPEN trades for stop/target/time exit ---
+    open_trades = await asyncio.to_thread(_list_trades_sync, "OPEN", None, 500)
     for t in open_trades:
         sym = t["symbol"]
         try:
@@ -4182,6 +4283,8 @@ async def _monitor_open_positions_once() -> dict[str, Any]:
     return {
         "closed": closed,
         "evaluated": len(open_trades),
+        "pending_evaluated": len(pending_trades),
+        "activated": activated,
         "market_status": market["status"],
         "market_open": market_is_open,
         "sl_target_checks_skipped": (not market_is_open) and len(open_trades) > 0,
@@ -5129,6 +5232,7 @@ async def paper_portfolio(user: dict = Depends(get_current_user)) -> dict[str, A
     equity = starting_capital + realised
 
     open_trades = await asyncio.to_thread(_list_trades_sync, "OPEN", None, 200, uid)
+    pending_trades = await asyncio.to_thread(_list_trades_sync, "PENDING", None, 200, uid)
     unrealised = 0.0
     marked_positions: list[dict[str, Any]] = []
     for t in open_trades:
@@ -5183,8 +5287,10 @@ async def paper_portfolio(user: dict = Depends(get_current_user)) -> dict[str, A
         },
         "positions": {
             "open_count": len(marked_positions),
+            "pending_count": len(pending_trades),
             "max_open": int(settings["max_open_positions"]),
             "open": marked_positions,
+            "pending": pending_trades,
         },
         "stats": {
             "closed_count": n_closed,

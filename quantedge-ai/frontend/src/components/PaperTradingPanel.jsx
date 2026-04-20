@@ -607,6 +607,7 @@ export function PaperTradingPanel({ refreshToken }) {
   const cap = portfolio?.capital || {};
   const stats = portfolio?.stats || {};
   const open = portfolio?.positions?.open || [];
+  const pending = portfolio?.positions?.pending || [];
   const pnlUnreal = Number(cap.unrealised_pnl || 0);
   const pnlReal = Number(cap.realised_pnl || 0);
 
@@ -848,6 +849,52 @@ export function PaperTradingPanel({ refreshToken }) {
             </tbody>
           </table>
         </div>
+
+        {pending.length > 0 && (
+          <>
+            <h4 style={{ margin: '16px 0 8px', color: C.yellow, fontSize: 13, fontWeight: 700 }}>
+              Pending orders ({pending.length}) — waiting for entry fill
+            </h4>
+            <div style={{ overflowX: 'auto', marginBottom: 14 }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                <thead>
+                  <tr style={{ color: C.muted, fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.6 }}>
+                    {['#', 'Symbol', 'Qty', 'Entry', 'Stop', 'Target', 'Last Price', 'Gap', 'Source', 'Created'].map((h) => (
+                      <th key={h} style={{ textAlign: 'left', padding: '0.5rem 0.6rem', borderBottom: `1px solid ${C.border}` }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {pending.map((t) => {
+                    const gap = t.last_price != null ? ((t.last_price - t.entry_price) / t.entry_price * 100) : null;
+                    return (
+                      <tr key={t.id} style={{ borderBottom: `1px solid ${C.border}`, opacity: 0.85 }}>
+                        <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: C.muted }}>{t.id}</td>
+                        <td style={{ padding: '0.55rem 0.6rem', fontWeight: 700, fontFamily: FONT_MONO }}>{t.symbol}</td>
+                        <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO }}>{t.quantity}</td>
+                        <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: C.yellow }}>₹{fmt(t.entry_price)}</td>
+                        <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: C.red }}>₹{fmt(t.stop_loss)}</td>
+                        <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: C.green }}>₹{fmt(t.target_price)}</td>
+                        <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO }}>{t.last_price != null ? `₹${fmt(t.last_price)}` : '—'}</td>
+                        <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: gap != null && gap > 0 ? C.red : C.green }}>
+                          {gap != null ? `${gap > 0 ? '+' : ''}${gap.toFixed(2)}%` : '—'}
+                        </td>
+                        <td style={{ padding: '0.55rem 0.6rem', fontSize: 11 }}>
+                          <span style={{ padding: '2px 8px', borderRadius: 999, background: 'rgba(251,191,36,0.12)', color: C.yellow, border: `1px solid ${C.yellow}`, fontSize: 10.5, fontWeight: 700, letterSpacing: 0.4 }}>
+                            PENDING
+                          </span>
+                        </td>
+                        <td style={{ padding: '0.55rem 0.6rem', color: C.muted, fontFamily: FONT_MONO, fontSize: 11 }}>
+                          {formatDateTime(t.opened_at)}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </>
+        )}
 
         <h4 style={{ margin: '0 0 8px', color: C.text, fontSize: 13, fontWeight: 700 }}>
           Recently closed ({closedTrades.length})
