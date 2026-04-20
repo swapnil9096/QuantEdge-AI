@@ -414,6 +414,19 @@ export async function closePaperTrade(id, price = null) {
   return r.json();
 }
 
+export async function updatePaperTradeSL(id, stopLoss) {
+  const r = await fetch(`${API_BASE}/paper-trades/${id}/sl`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ stop_loss: stopLoss }),
+  });
+  if (!r.ok) {
+    const t = await r.text().catch(() => '');
+    throw new Error(`update-sl ${r.status}: ${t.slice(0, 200)}`);
+  }
+  return r.json();
+}
+
 export async function runMonitorNow() {
   const r = await fetch(`${API_BASE}/paper-trades/monitor-now`, { method: 'POST' });
   if (!r.ok) throw new Error(`monitor-now ${r.status}`);

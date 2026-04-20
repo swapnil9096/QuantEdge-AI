@@ -1,7 +1,7 @@
 import React, { useState, useCallback, useEffect } from 'react';
 import {
-  Activity, AlertTriangle, CircleDollarSign, Eye, Gauge,
-  LineChart as LineIcon, RefreshCw, TrendingDown, TrendingUp, Trophy, X, Zap,
+  Activity, AlertTriangle, Check, CircleDollarSign, Eye, Gauge,
+  LineChart as LineIcon, Pencil, RefreshCw, TrendingDown, TrendingUp, Trophy, X, Zap,
 } from 'lucide-react';
 import {
   Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis,
@@ -11,7 +11,7 @@ import { Spinner, Section, KpiCard, MarketStatusBanner } from './shared.jsx';
 import { fmt, fmtPct, fmtMoney, formatDateTime } from '../utils/format.js';
 import {
   fetchPaperPortfolio, fetchEquityCurve, fetchPaperSettings, patchPaperSettings,
-  fetchPaperTrades, closePaperTrade, runMonitorNow, fetchTelegramStatus, sendTelegramTest,
+  fetchPaperTrades, closePaperTrade, updatePaperTradeSL, runMonitorNow, fetchTelegramStatus, sendTelegramTest,
 } from '../utils/api.js';
 
 // ---------------------------------------------------------------------------
@@ -525,6 +525,8 @@ export function PaperTradingPanel({ refreshToken }) {
   const [pendingAction, setPendingAction] = useState(null);
   // Local draft for threshold input — decouples visual typing from API calls
   const [thresholdDraft, setThresholdDraft] = useState(null);
+  // Inline SL editing: { tradeId, value }
+  const [editingSL, setEditingSL] = useState(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -601,6 +603,21 @@ export function PaperTradingPanel({ refreshToken }) {
       setError(exc.message || String(exc));
     } finally {
       setPendingAction(null);
+    }
+  };
+
+  const saveSL = async (tradeId, newSL) => {
+    const val = parseFloat(newSL);
+    if (!Number.isFinite(val) || val <= 0) { setEditingSL(null); return; }
+    setPendingAction(`sl-${tradeId}`);
+    try {
+      await updatePaperTradeSL(tradeId, val);
+      await load();
+    } catch (exc) {
+      setError(exc.message || String(exc));
+    } finally {
+      setPendingAction(null);
+      setEditingSL(null);
     }
   };
 
@@ -830,10 +847,46 @@ export function PaperTradingPanel({ refreshToken }) {
                       ) : '—'}
                     </td>
                     <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: C.red }}>
-                      ₹{fmt(t.stop_loss)}
-                      {t.sl_mode !== 'fixed' && t.trailing_activated ? (
-                        <span style={{ fontSize: 9, color: C.yellow, marginLeft: 3 }}>TSL</span>
-                      ) : null}
+                      {editingSL?.tradeId === t.id ? (
+                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
+                          <span style={{ color: C.muted }}>₹</span>
+                          <input
+                            autoFocus
+                            type="number"
+                            step="0.05"
+                            value={editingSL.value}
+                            onChange={(e) => setEditingSL({ tradeId: t.id, value: e.target.value })}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') saveSL(t.id, editingSL.value);
+                              if (e.key === 'Escape') setEditingSL(null);
+                            }}
+                            onBlur={() => setEditingSL(null)}
+                            style={{
+                              width: 72, background: C.dark, color: C.red, border: `1px solid ${C.yellow}`,
+                              borderRadius: 4, padding: '1px 4px', fontSize: 12, fontFamily: FONT_MONO,
+                              outline: 'none',
+                            }}
+                          />
+                          <button
+                            onMouseDown={(e) => { e.preventDefault(); saveSL(t.id, editingSL.value); }}
+                            style={{ background: 'transparent', border: 'none', color: C.green, cursor: 'pointer', padding: 0 }}
+                          >
+                            <Check size={12} />
+                          </button>
+                        </span>
+                      ) : (
+                        <span
+                          style={{ cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 3 }}
+                          onClick={() => setEditingSL({ tradeId: t.id, value: t.stop_loss })}
+                          title="Click to edit stop loss"
+                        >
+                          ₹{fmt(t.stop_loss)}
+                          <Pencil size={9} style={{ color: C.muted, opacity: 0.6 }} />
+                          {t.sl_mode !== 'fixed' && t.trailing_activated ? (
+                            <span style={{ fontSize: 9, color: C.yellow, marginLeft: 1 }}>TSL</span>
+                          ) : null}
+                        </span>
+                      )}
                     </td>
                     <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: C.green }}>₹{fmt(t.target_price)}</td>
                     <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: pnlColor }}>{fmtMoney(t.unrealised_pnl)}</td>

@@ -4714,6 +4714,7 @@ async def api_info() -> dict[str, Any]:
             "POST /paper-trades",
             "GET /paper-trades/{id}",
             "POST /paper-trades/{id}/close",
+            "PATCH /paper-trades/{id}/sl",
             "POST /paper-trades/monitor-now",
             "GET /telegram-status",
             "POST /telegram-test",
@@ -5362,6 +5363,10 @@ class PaperCloseRequest(BaseModel):
     reason: str = Field(default="MANUAL_CLOSE")
 
 
+class PaperUpdateSLRequest(BaseModel):
+    stop_loss: float = Field(..., gt=0)
+
+
 class PaperSettingsUpdate(BaseModel):
     auto_trade_enabled: Optional[bool] = None
     auto_trade_threshold: Optional[int] = Field(default=None, ge=0, le=100)
@@ -5705,6 +5710,32 @@ async def close_paper_trade_endpoint(
         return await close_paper_trade(trade_id, price=req.price, reason=req.reason or EXIT_MANUAL)
     except PaperTradeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.patch("/paper-trades/{trade_id}/sl")
+async def update_paper_trade_sl(
+    trade_id: int, req: PaperUpdateSLRequest, user: dict = Depends(get_current_user)
+) -> dict[str, Any]:
+    trade = await asyncio.to_thread(_fetch_trade_sync, trade_id, user["user_id"])
+    if trade is None:
+        raise HTTPException(status_code=404, detail=f"Paper trade {trade_id} not found.")
+    if trade["status"] not in ("OPEN", "PENDING"):
+        raise HTTPException(status_code=400, detail=f"Trade {trade_id} is {trade['status']} — cannot modify SL.")
+    entry = float(trade["entry_price"])
+    if req.stop_loss >= entry:
+        raise HTTPException(status_code=400, detail=f"Stop loss (₹{req.stop_loss:.2f}) must be below entry (₹{entry:.2f}).")
+
+    def _update() -> dict[str, Any]:
+        with _db_lock, _db_connect() as conn:
+            conn.execute(
+                "UPDATE paper_trades SET stop_loss=?, original_stop=? WHERE id=? AND status IN ('OPEN','PENDING')",
+                (float(req.stop_loss), float(req.stop_loss), int(trade_id)),
+            )
+        return _fetch_trade_sync(trade_id)
+
+    updated = await asyncio.to_thread(_update)
+    logger.info("Paper trade #%d SL updated to %.2f by user %s", trade_id, req.stop_loss, user["user_id"])
+    return updated
 
 
 @app.post("/paper-trades/monitor-now")
