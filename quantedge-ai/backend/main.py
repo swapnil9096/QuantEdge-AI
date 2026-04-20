@@ -5333,6 +5333,13 @@ async def deep_analyze_endpoint(
     market = get_market_status()
     result = {**result, "market_status": market}
 
+    # Attach news sentiment so the UI can show it alongside the analysis.
+    try:
+        news = await asyncio.to_thread(_fetch_news_sentiment_sync, symbol)
+        result = {**result, "news_sentiment": news}
+    except Exception:
+        pass
+
     # Auto paper-trade hook: opens a trade if settings allow and score ≥ threshold.
     try:
         auto_trade, auto_meta = await maybe_auto_paper_trade(symbol, result, history_id=history_id, user_id=user["user_id"])

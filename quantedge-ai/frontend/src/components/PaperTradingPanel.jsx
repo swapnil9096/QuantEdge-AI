@@ -7,11 +7,12 @@ import {
   Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from 'recharts';
 import { C, FONT_MONO } from '../constants.js';
-import { Spinner, Section, KpiCard, MarketStatusBanner } from './shared.jsx';
+import { Spinner, Section, KpiCard, MarketStatusBanner, SentimentBadge } from './shared.jsx';
 import { fmt, fmtPct, fmtMoney, formatDateTime } from '../utils/format.js';
 import {
   fetchPaperPortfolio, fetchEquityCurve, fetchPaperSettings, patchPaperSettings,
-  fetchPaperTrades, closePaperTrade, updatePaperTradeSL, runMonitorNow, fetchTelegramStatus, sendTelegramTest,
+  fetchPaperTrades, closePaperTrade, updatePaperTradeSL, runMonitorNow,
+  fetchTelegramStatus, sendTelegramTest, fetchNewsSentiment,
 } from '../utils/api.js';
 
 // ---------------------------------------------------------------------------
@@ -527,6 +528,8 @@ export function PaperTradingPanel({ refreshToken }) {
   const [thresholdDraft, setThresholdDraft] = useState(null);
   // Inline SL editing: { tradeId, value }
   const [editingSL, setEditingSL] = useState(null);
+  // Sentiment data keyed by symbol
+  const [sentiment, setSentiment] = useState({});
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -552,6 +555,26 @@ export function PaperTradingPanel({ refreshToken }) {
     const id = setInterval(load, 30_000);
     return () => clearInterval(id);
   }, [load]);
+
+  useEffect(() => {
+    const openSyms = (portfolio?.positions?.open || []).map((t) => t.symbol);
+    const pendSyms = (portfolio?.positions?.pending || []).map((t) => t.symbol);
+    const all = [...new Set([...openSyms, ...pendSyms].filter(Boolean))];
+    if (!all.length) return;
+    let cancelled = false;
+    const fetchAll = async () => {
+      for (const sym of all) {
+        if (cancelled) break;
+        try {
+          const d = await fetchNewsSentiment(sym);
+          if (!cancelled) setSentiment((prev) => ({ ...prev, [sym]: d }));
+        } catch {}
+      }
+    };
+    fetchAll();
+    const id = setInterval(fetchAll, 300_000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [portfolio]);
 
   const toggleAuto = async () => {
     if (!settings) return;
@@ -832,7 +855,17 @@ export function PaperTradingPanel({ refreshToken }) {
                     onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
                   >
                     <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: C.muted }}>{t.id}</td>
-                    <td style={{ padding: '0.55rem 0.6rem', fontWeight: 700, fontFamily: FONT_MONO }}>{t.symbol}</td>
+                    <td style={{ padding: '0.55rem 0.6rem', fontWeight: 700, fontFamily: FONT_MONO }}>
+                      {t.symbol}
+                      {sentiment[t.symbol] && (
+                        <span style={{ marginLeft: 5 }}>
+                          <SentimentBadge
+                            label={sentiment[t.symbol].sentiment_label}
+                            score={sentiment[t.symbol].sentiment_score}
+                          />
+                        </span>
+                      )}
+                    </td>
                     <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO }}>{t.quantity}</td>
                     <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO }}>₹{fmt(t.entry_price)}</td>
                     <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO }}>
