@@ -765,17 +765,6 @@ export function PaperTradingPanel({ refreshToken }) {
                 {settings.sl_mode === 'hybrid' ? ` · activate @+${settings.trailing_activation_pct || 1}%` : ''}
               </span>
             )}
-            <label style={{ display: 'flex', alignItems: 'center', gap: 4, color: settings.partial_exit_enabled ? C.teal : C.sub, cursor: 'pointer' }}>
-              <input
-                type="checkbox"
-                checked={!!settings.partial_exit_enabled}
-                onChange={async (e) => {
-                  try { setSettings(await patchPaperSettings({ partial_exit_enabled: e.target.checked })); } catch {}
-                }}
-                style={{ accentColor: C.teal }}
-              />
-              Partial exits ({settings.partial_exit_ratio || 50}% at T1)
-            </label>
           </div>
         </>)}
 
@@ -845,16 +834,8 @@ export function PaperTradingPanel({ refreshToken }) {
                       {t.sl_mode !== 'fixed' && t.trailing_activated ? (
                         <span style={{ fontSize: 9, color: C.yellow, marginLeft: 3 }}>TSL</span>
                       ) : null}
-                      {t.partial_exit_done ? (
-                        <span style={{ fontSize: 9, color: C.teal, marginLeft: 3 }}>C2C</span>
-                      ) : null}
                     </td>
-                    <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: C.green }}>
-                      ₹{fmt(t.target_price)}
-                      {t.partial_exit_done && t.target2_price ? (
-                        <span style={{ fontSize: 9, color: C.muted, marginLeft: 3 }}>T2: ₹{fmt(t.target2_price)}</span>
-                      ) : null}
-                    </td>
+                    <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: C.green }}>₹{fmt(t.target_price)}</td>
                     <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: pnlColor }}>{fmtMoney(t.unrealised_pnl)}</td>
                     <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: pnlColor }}>
                       {t.unrealised_pnl_pct != null ? fmtPct(t.unrealised_pnl_pct) : '—'}

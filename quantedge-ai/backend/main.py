@@ -4357,7 +4357,6 @@ async def _monitor_open_positions_once() -> dict[str, Any]:
 
     # --- Phase 2: check OPEN trades for TSL update + stop/target/time exit ---
     open_trades = await asyncio.to_thread(_list_trades_sync, "OPEN", None, 500)
-    partial_exits = 0
     for t in open_trades:
         sym = t["symbol"]
         try:
@@ -4419,32 +4418,8 @@ async def _monitor_open_positions_once() -> dict[str, Any]:
                 closed += 1
                 continue
 
-            # --- Partial target exit logic ---
-            partial_done = bool(t.get("partial_exit_done", 0))
-            partial_enabled = bool(settings.get("partial_exit_enabled", False))
-            target2 = t.get("target2_price")
-
-            if partial_enabled and not partial_done and price >= target:
-                ratio = float(settings.get("partial_exit_ratio", 50.0)) / 100.0
-                remaining = int(t.get("remaining_qty") or t["quantity"])
-                sell_qty = max(1, int(remaining * ratio))
-                result = await asyncio.to_thread(
-                    _partial_close_trade_sync, int(t["id"]), target, sell_qty, EXIT_PARTIAL
-                )
-                if result:
-                    partial_exits += 1
-                    logger.info(
-                        "Partial exit #%d %s: sold %d @ %.2f, remaining %d, SL→entry",
-                        t["id"], sym, sell_qty, target, remaining - sell_qty,
-                    )
-                continue
-
-            if partial_done and target2 and price >= float(target2):
-                await close_paper_trade(int(t["id"]), price=float(target2), reason=EXIT_TARGET2)
-                closed += 1
-                continue
-
-            if not partial_enabled and price >= target:
+            # --- Target exit ---
+            if price >= target:
                 await close_paper_trade(int(t["id"]), price=target, reason=EXIT_TARGET)
                 closed += 1
                 continue
@@ -4462,7 +4437,6 @@ async def _monitor_open_positions_once() -> dict[str, Any]:
     return {
         "closed": closed,
         "evaluated": len(open_trades),
-        "partial_exits": partial_exits,
         "pending_evaluated": len(pending_trades),
         "activated": activated,
         "market_status": market["status"],
@@ -5404,8 +5378,6 @@ class PaperSettingsUpdate(BaseModel):
     sl_mode: Optional[str] = Field(default=None, pattern=r"^(fixed|trailing|hybrid)$")
     atr_multiplier: Optional[float] = Field(default=None, gt=0, le=10)
     trailing_activation_pct: Optional[float] = Field(default=None, ge=0, le=50)
-    partial_exit_enabled: Optional[bool] = None
-    partial_exit_ratio: Optional[float] = Field(default=None, gt=0, le=100)
 
 
 # ---------------------------------------------------------------------------

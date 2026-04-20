@@ -128,7 +128,7 @@ export function DashboardTab() {
           { label: 'Unrealised P&L', value: fmtMoney(d.unrealisedPnL), color: (d.unrealisedPnL || 0) >= 0 ? C.green : C.red },
           { label: 'SL Mode', value: (d.settings?.sl_mode || 'fixed').toUpperCase(), color: C.yellow },
           { label: 'Risk/Trade', value: `${d.settings?.risk_per_trade_pct || 1}%` },
-          { label: 'Partial Exits', value: d.settings?.partial_exit_enabled ? 'ON' : 'OFF', color: d.settings?.partial_exit_enabled ? C.teal : C.muted },
+          { label: 'ATR Multiplier', value: `${d.settings?.atr_multiplier || 1.5}×` },
         ].map((item) => (
           <div key={item.label} style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
             <span style={{ color: C.muted, fontSize: 10.5, textTransform: 'uppercase', letterSpacing: 0.5 }}>{item.label}</span>
