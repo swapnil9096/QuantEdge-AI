@@ -769,7 +769,7 @@ export function PaperTradingPanel({ refreshToken }) {
           <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
             <thead>
               <tr style={{ color: C.muted, fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.6 }}>
-                {['#', 'Symbol', 'Qty', 'Entry', 'Stop', 'Target', 'Last', 'P&L', 'P&L %', 'Source', 'Opened', ''].map((h) => (
+                {['#', 'Symbol', 'Qty', 'Entry', 'CMP', 'Stop', 'Target', 'P&L', 'P&L %', 'Source', 'Opened', ''].map((h) => (
                   <th key={h} style={{ textAlign: 'left', padding: '0.5rem 0.6rem', borderBottom: `1px solid ${C.border}` }}>{h}</th>
                 ))}
               </tr>
@@ -793,9 +793,19 @@ export function PaperTradingPanel({ refreshToken }) {
                     <td style={{ padding: '0.55rem 0.6rem', fontWeight: 700, fontFamily: FONT_MONO }}>{t.symbol}</td>
                     <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO }}>{t.quantity}</td>
                     <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO }}>₹{fmt(t.entry_price)}</td>
+                    <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO }}>
+                      {t.last_price != null ? (
+                        <span style={{ color: t.last_price >= t.entry_price ? C.green : C.red, fontWeight: 700 }}>
+                          ₹{fmt(t.last_price)}
+                          <span style={{ fontSize: 10, fontWeight: 400, marginLeft: 4 }}>
+                            {t.last_price >= t.entry_price ? '▲' : '▼'}
+                            {Math.abs(((t.last_price - t.entry_price) / t.entry_price) * 100).toFixed(1)}%
+                          </span>
+                        </span>
+                      ) : '—'}
+                    </td>
                     <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: C.red }}>₹{fmt(t.stop_loss)}</td>
                     <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: C.green }}>₹{fmt(t.target_price)}</td>
-                    <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO }}>{t.last_price != null ? `₹${fmt(t.last_price)}` : '—'}</td>
                     <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: pnlColor }}>{fmtMoney(t.unrealised_pnl)}</td>
                     <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: pnlColor }}>
                       {t.unrealised_pnl_pct != null ? fmtPct(t.unrealised_pnl_pct) : '—'}
