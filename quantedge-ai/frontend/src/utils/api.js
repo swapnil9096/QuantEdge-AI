@@ -414,9 +414,38 @@ export async function closePaperTrade(id, price = null) {
   return r.json();
 }
 
+export async function updatePaperTradeSL(id, stopLoss) {
+  const r = await fetch(`${API_BASE}/paper-trades/${id}/sl`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ stop_loss: stopLoss }),
+  });
+  if (!r.ok) {
+    const t = await r.text().catch(() => '');
+    throw new Error(`update-sl ${r.status}: ${t.slice(0, 200)}`);
+  }
+  return r.json();
+}
+
 export async function runMonitorNow() {
   const r = await fetch(`${API_BASE}/paper-trades/monitor-now`, { method: 'POST' });
   if (!r.ok) throw new Error(`monitor-now ${r.status}`);
+  return r.json();
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard & Sentiment
+// ---------------------------------------------------------------------------
+
+export async function fetchDashboardSummary() {
+  const r = await fetch(`${API_BASE}/dashboard/summary`);
+  if (!r.ok) throw new Error(`dashboard/summary ${r.status}`);
+  return r.json();
+}
+
+export async function fetchNewsSentiment(symbol) {
+  const r = await fetch(`${API_BASE}/news/sentiment?symbol=${encodeURIComponent(symbol)}`);
+  if (!r.ok) throw new Error(`news/sentiment ${r.status}`);
   return r.json();
 }
 

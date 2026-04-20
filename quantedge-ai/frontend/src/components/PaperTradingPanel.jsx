@@ -1,17 +1,18 @@
 import React, { useState, useCallback, useEffect } from 'react';
 import {
-  Activity, AlertTriangle, CircleDollarSign, Eye, Gauge,
-  LineChart as LineIcon, RefreshCw, TrendingDown, TrendingUp, Trophy, X, Zap,
+  Activity, AlertTriangle, Check, CircleDollarSign, Eye, Gauge,
+  LineChart as LineIcon, Pencil, RefreshCw, TrendingDown, TrendingUp, Trophy, X, Zap,
 } from 'lucide-react';
 import {
   Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from 'recharts';
 import { C, FONT_MONO } from '../constants.js';
-import { Spinner, Section, KpiCard, MarketStatusBanner } from './shared.jsx';
+import { Spinner, Section, KpiCard, MarketStatusBanner, SentimentBadge } from './shared.jsx';
 import { fmt, fmtPct, fmtMoney, formatDateTime } from '../utils/format.js';
 import {
   fetchPaperPortfolio, fetchEquityCurve, fetchPaperSettings, patchPaperSettings,
-  fetchPaperTrades, closePaperTrade, runMonitorNow, fetchTelegramStatus, sendTelegramTest,
+  fetchPaperTrades, closePaperTrade, updatePaperTradeSL, runMonitorNow,
+  fetchTelegramStatus, sendTelegramTest, fetchNewsSentiment,
 } from '../utils/api.js';
 
 // ---------------------------------------------------------------------------
@@ -525,6 +526,10 @@ export function PaperTradingPanel({ refreshToken }) {
   const [pendingAction, setPendingAction] = useState(null);
   // Local draft for threshold input — decouples visual typing from API calls
   const [thresholdDraft, setThresholdDraft] = useState(null);
+  // Inline SL editing: { tradeId, value }
+  const [editingSL, setEditingSL] = useState(null);
+  // Sentiment data keyed by symbol
+  const [sentiment, setSentiment] = useState({});
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -550,6 +555,26 @@ export function PaperTradingPanel({ refreshToken }) {
     const id = setInterval(load, 30_000);
     return () => clearInterval(id);
   }, [load]);
+
+  useEffect(() => {
+    const openSyms = (portfolio?.positions?.open || []).map((t) => t.symbol);
+    const pendSyms = (portfolio?.positions?.pending || []).map((t) => t.symbol);
+    const all = [...new Set([...openSyms, ...pendSyms].filter(Boolean))];
+    if (!all.length) return;
+    let cancelled = false;
+    const fetchAll = async () => {
+      for (const sym of all) {
+        if (cancelled) break;
+        try {
+          const d = await fetchNewsSentiment(sym);
+          if (!cancelled) setSentiment((prev) => ({ ...prev, [sym]: d }));
+        } catch {}
+      }
+    };
+    fetchAll();
+    const id = setInterval(fetchAll, 300_000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [portfolio]);
 
   const toggleAuto = async () => {
     if (!settings) return;
@@ -604,9 +629,25 @@ export function PaperTradingPanel({ refreshToken }) {
     }
   };
 
+  const saveSL = async (tradeId, newSL) => {
+    const val = parseFloat(newSL);
+    if (!Number.isFinite(val) || val <= 0) { setEditingSL(null); return; }
+    setPendingAction(`sl-${tradeId}`);
+    try {
+      await updatePaperTradeSL(tradeId, val);
+      await load();
+    } catch (exc) {
+      setError(exc.message || String(exc));
+    } finally {
+      setPendingAction(null);
+      setEditingSL(null);
+    }
+  };
+
   const cap = portfolio?.capital || {};
   const stats = portfolio?.stats || {};
   const open = portfolio?.positions?.open || [];
+  const pending = portfolio?.positions?.pending || [];
   const pnlUnreal = Number(cap.unrealised_pnl || 0);
   const pnlReal = Number(cap.realised_pnl || 0);
 
@@ -662,7 +703,7 @@ export function PaperTradingPanel({ refreshToken }) {
 
         {portfolio?.market_status && <MarketStatusBanner market={portfolio.market_status} />}
 
-        {settings && (
+        {settings && (<>
           <div
             style={{
               display: 'flex',
@@ -740,7 +781,32 @@ export function PaperTradingPanel({ refreshToken }) {
               {settings.max_open_positions} open · Hold ≤ {settings.max_hold_days}d
             </div>
           </div>
-        )}
+          <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 14, fontSize: 12, marginTop: 6 }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 6, color: C.sub }}>
+              SL Mode
+              <select
+                value={settings.sl_mode || 'fixed'}
+                onChange={async (e) => {
+                  try { setSettings(await patchPaperSettings({ sl_mode: e.target.value })); } catch {}
+                }}
+                style={{
+                  background: C.dark, color: C.text, border: `1px solid ${C.border}`,
+                  borderRadius: 6, padding: '2px 6px', fontSize: 11, fontFamily: FONT_MONO,
+                }}
+              >
+                <option value="fixed">Fixed</option>
+                <option value="trailing">Trailing</option>
+                <option value="hybrid">Hybrid</option>
+              </select>
+            </label>
+            {settings.sl_mode !== 'fixed' && (
+              <span style={{ color: C.muted, fontSize: 10.5, fontFamily: FONT_MONO }}>
+                ATR×{settings.atr_multiplier || 1.5}
+                {settings.sl_mode === 'hybrid' ? ` · activate @+${settings.trailing_activation_pct || 1}%` : ''}
+              </span>
+            )}
+          </div>
+        </>)}
 
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, marginBottom: 14 }}>
           <KpiCard icon={<CircleDollarSign size={14} />} label="Equity" value={fmtMoney(cap.total_equity)} sub={`Start ${fmtMoney(cap.starting)}`} color={C.teal} />
@@ -768,7 +834,7 @@ export function PaperTradingPanel({ refreshToken }) {
           <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
             <thead>
               <tr style={{ color: C.muted, fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.6 }}>
-                {['#', 'Symbol', 'Qty', 'Entry', 'Stop', 'Target', 'Last', 'P&L', 'P&L %', 'Source', 'Opened', ''].map((h) => (
+                {['#', 'Symbol', 'Qty', 'Entry', 'CMP', 'Stop', 'Target', 'P&L', 'P&L %', 'Source', 'Opened', ''].map((h) => (
                   <th key={h} style={{ textAlign: 'left', padding: '0.5rem 0.6rem', borderBottom: `1px solid ${C.border}` }}>{h}</th>
                 ))}
               </tr>
@@ -789,12 +855,73 @@ export function PaperTradingPanel({ refreshToken }) {
                     onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
                   >
                     <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: C.muted }}>{t.id}</td>
-                    <td style={{ padding: '0.55rem 0.6rem', fontWeight: 700, fontFamily: FONT_MONO }}>{t.symbol}</td>
+                    <td style={{ padding: '0.55rem 0.6rem', fontWeight: 700, fontFamily: FONT_MONO }}>
+                      {t.symbol}
+                      {sentiment[t.symbol] && (
+                        <span style={{ marginLeft: 5 }}>
+                          <SentimentBadge
+                            label={sentiment[t.symbol].sentiment_label}
+                            score={sentiment[t.symbol].sentiment_score}
+                          />
+                        </span>
+                      )}
+                    </td>
                     <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO }}>{t.quantity}</td>
                     <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO }}>₹{fmt(t.entry_price)}</td>
-                    <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: C.red }}>₹{fmt(t.stop_loss)}</td>
+                    <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO }}>
+                      {t.last_price != null ? (
+                        <span style={{ color: t.last_price >= t.entry_price ? C.green : C.red, fontWeight: 700 }}>
+                          ₹{fmt(t.last_price)}
+                          <span style={{ fontSize: 10, fontWeight: 400, marginLeft: 4 }}>
+                            {t.last_price >= t.entry_price ? '▲' : '▼'}
+                            {Math.abs(((t.last_price - t.entry_price) / t.entry_price) * 100).toFixed(1)}%
+                          </span>
+                        </span>
+                      ) : '—'}
+                    </td>
+                    <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: C.red }}>
+                      {editingSL?.tradeId === t.id ? (
+                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
+                          <span style={{ color: C.muted }}>₹</span>
+                          <input
+                            autoFocus
+                            type="number"
+                            step="0.05"
+                            value={editingSL.value}
+                            onChange={(e) => setEditingSL({ tradeId: t.id, value: e.target.value })}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') saveSL(t.id, editingSL.value);
+                              if (e.key === 'Escape') setEditingSL(null);
+                            }}
+                            onBlur={() => setEditingSL(null)}
+                            style={{
+                              width: 72, background: C.dark, color: C.red, border: `1px solid ${C.yellow}`,
+                              borderRadius: 4, padding: '1px 4px', fontSize: 12, fontFamily: FONT_MONO,
+                              outline: 'none',
+                            }}
+                          />
+                          <button
+                            onMouseDown={(e) => { e.preventDefault(); saveSL(t.id, editingSL.value); }}
+                            style={{ background: 'transparent', border: 'none', color: C.green, cursor: 'pointer', padding: 0 }}
+                          >
+                            <Check size={12} />
+                          </button>
+                        </span>
+                      ) : (
+                        <span
+                          style={{ cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 3 }}
+                          onClick={() => setEditingSL({ tradeId: t.id, value: t.stop_loss })}
+                          title="Click to edit stop loss"
+                        >
+                          ₹{fmt(t.stop_loss)}
+                          <Pencil size={9} style={{ color: C.muted, opacity: 0.6 }} />
+                          {t.sl_mode !== 'fixed' && t.trailing_activated ? (
+                            <span style={{ fontSize: 9, color: C.yellow, marginLeft: 1 }}>TSL</span>
+                          ) : null}
+                        </span>
+                      )}
+                    </td>
                     <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: C.green }}>₹{fmt(t.target_price)}</td>
-                    <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO }}>{t.last_price != null ? `₹${fmt(t.last_price)}` : '—'}</td>
                     <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: pnlColor }}>{fmtMoney(t.unrealised_pnl)}</td>
                     <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: pnlColor }}>
                       {t.unrealised_pnl_pct != null ? fmtPct(t.unrealised_pnl_pct) : '—'}
@@ -848,6 +975,52 @@ export function PaperTradingPanel({ refreshToken }) {
             </tbody>
           </table>
         </div>
+
+        {pending.length > 0 && (
+          <>
+            <h4 style={{ margin: '16px 0 8px', color: C.yellow, fontSize: 13, fontWeight: 700 }}>
+              Pending orders ({pending.length}) — waiting for entry fill
+            </h4>
+            <div style={{ overflowX: 'auto', marginBottom: 14 }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                <thead>
+                  <tr style={{ color: C.muted, fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.6 }}>
+                    {['#', 'Symbol', 'Qty', 'Entry', 'Stop', 'Target', 'Last Price', 'Gap', 'Source', 'Created'].map((h) => (
+                      <th key={h} style={{ textAlign: 'left', padding: '0.5rem 0.6rem', borderBottom: `1px solid ${C.border}` }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {pending.map((t) => {
+                    const gap = t.last_price != null ? ((t.last_price - t.entry_price) / t.entry_price * 100) : null;
+                    return (
+                      <tr key={t.id} style={{ borderBottom: `1px solid ${C.border}`, opacity: 0.85 }}>
+                        <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: C.muted }}>{t.id}</td>
+                        <td style={{ padding: '0.55rem 0.6rem', fontWeight: 700, fontFamily: FONT_MONO }}>{t.symbol}</td>
+                        <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO }}>{t.quantity}</td>
+                        <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: C.yellow }}>₹{fmt(t.entry_price)}</td>
+                        <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: C.red }}>₹{fmt(t.stop_loss)}</td>
+                        <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: C.green }}>₹{fmt(t.target_price)}</td>
+                        <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO }}>{t.last_price != null ? `₹${fmt(t.last_price)}` : '—'}</td>
+                        <td style={{ padding: '0.55rem 0.6rem', fontFamily: FONT_MONO, color: gap != null && gap > 0 ? C.red : C.green }}>
+                          {gap != null ? `${gap > 0 ? '+' : ''}${gap.toFixed(2)}%` : '—'}
+                        </td>
+                        <td style={{ padding: '0.55rem 0.6rem', fontSize: 11 }}>
+                          <span style={{ padding: '2px 8px', borderRadius: 999, background: 'rgba(251,191,36,0.12)', color: C.yellow, border: `1px solid ${C.yellow}`, fontSize: 10.5, fontWeight: 700, letterSpacing: 0.4 }}>
+                            PENDING
+                          </span>
+                        </td>
+                        <td style={{ padding: '0.55rem 0.6rem', color: C.muted, fontFamily: FONT_MONO, fontSize: 11 }}>
+                          {formatDateTime(t.opened_at)}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </>
+        )}
 
         <h4 style={{ margin: '0 0 8px', color: C.text, fontSize: 13, fontWeight: 700 }}>
           Recently closed ({closedTrades.length})

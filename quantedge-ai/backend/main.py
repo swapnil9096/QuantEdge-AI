@@ -232,6 +232,26 @@ except ImportError:
 
 _data_dir = Path(os.getenv("DATA_DIR", str(Path(__file__).resolve().parent / "data")))
 _data_dir.mkdir(parents=True, exist_ok=True)
+
+if os.getenv("APP_ENV") == "production":
+    _marker = _data_dir / ".persist_check"
+    if _marker.exists():
+        logger.info("Persistent disk verified at %s (marker survived restart).", _data_dir)
+    else:
+        _marker.write_text(datetime.now(timezone.utc).isoformat())
+        logger.warning(
+            "PERSISTENCE MARKER written to %s. If this message appears on EVERY deploy, "
+            "your disk is NOT persistent — all user data WILL be lost. "
+            "Attach a Render Disk at /var/data and set DATA_DIR=/var/data.",
+            _data_dir,
+        )
+    if str(_data_dir).startswith("/app") or str(_data_dir) == str(Path(__file__).resolve().parent / "data"):
+        logger.error(
+            "DATA_DIR=%s is inside the app directory — this is EPHEMERAL on Render/Docker. "
+            "Set DATA_DIR=/var/data with a persistent disk attached, or all data will be lost on deploy.",
+            _data_dir,
+        )
+
 SECRETS_VAULT_PATH = _data_dir / "secrets.enc.json"
 SECRETS_VAULT_AAD = b"quantedge-secrets-v1"
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_HOURS", "24")) * 3600
@@ -278,6 +298,9 @@ _API_PATH_PREFIXES: tuple[str, ...] = (
     "/broker/",
     "/broker",
     "/train-ml",
+    "/dashboard/",
+    "/news/",
+    "/admin/",
     "/ws/",
     "/docs",
     "/openapi.json",
@@ -1408,7 +1431,7 @@ BT_MIN_AVG_RETURN = 2.0         # percent
 BT_FORWARD_DAYS = 20
 BT_HISTORY_DAYS = 750           # ~3y
 
-COMBINED_MIN_SCORE = 90
+COMBINED_MIN_SCORE = 70
 COMBINED_WEIGHTS = {
     "technical": 40,
     "fundamentals": 25,
@@ -2451,8 +2474,12 @@ async def deep_analyze(symbol: str, exchange: str = "NSE") -> dict[str, Any]:
         "failures": tech_failures,
     }
 
-    # Levels & R/R
-    entry = indicators["close"]
+    # Levels & R/R — use live price so the paper trade fills at actual market.
+    try:
+        _live = await asyncio.to_thread(_fetch_live_stock_data, symbol, exchange)
+        entry = float(_live["price"])
+    except Exception:
+        entry = indicators["close"]
     atr = max(indicators["atr"], entry * 0.005)
     stop = entry - 1.5 * atr
     target1 = entry + 3.0 * atr
@@ -2587,6 +2614,7 @@ async def deep_analyze(symbol: str, exchange: str = "NSE") -> dict[str, Any]:
 
 
 DB_PATH = _data_dir / "quantedge.db"
+_DB_BACKUP_PATH = _data_dir / "quantedge.db.backup"
 
 _db_lock = threading.Lock()  # single SQLite writer; reads are safe concurrently
 
@@ -2594,10 +2622,44 @@ _db_lock = threading.Lock()  # single SQLite writer; reads are safe concurrently
 def _db_connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=10.0, isolation_level=None)
     conn.row_factory = sqlite3.Row
-    # WAL keeps readers unblocked while writers commit; good default for a single-file DB.
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     return conn
+
+
+_last_backup_time: float = 0.0
+_BACKUP_INTERVAL = 300  # backup at most once every 5 minutes
+
+
+def _db_backup() -> None:
+    """Incremental backup of the SQLite DB. Called after important writes."""
+    global _last_backup_time
+    now = time.monotonic()
+    if now - _last_backup_time < _BACKUP_INTERVAL:
+        return
+    _last_backup_time = now
+    try:
+        import shutil
+        shutil.copy2(DB_PATH, _DB_BACKUP_PATH)
+    except Exception as exc:
+        logger.debug("DB backup failed: %s", exc)
+
+
+def _db_restore_if_empty() -> None:
+    """On startup, if the main DB is missing/empty but a backup exists, restore it."""
+    if DB_PATH.exists() and DB_PATH.stat().st_size > 0:
+        return
+    if not _DB_BACKUP_PATH.exists() or _DB_BACKUP_PATH.stat().st_size == 0:
+        return
+    try:
+        import shutil
+        shutil.copy2(_DB_BACKUP_PATH, DB_PATH)
+        logger.info("Restored database from backup (%d bytes).", _DB_BACKUP_PATH.stat().st_size)
+    except Exception as exc:
+        logger.error("DB restore from backup failed: %s", exc)
+
+
+_db_restore_if_empty()
 
 
 def _init_history_schema() -> None:
@@ -2641,12 +2703,12 @@ def _init_history_schema() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_history_high_prob ON deep_analysis_history(high_probability)"
         )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_history_user ON deep_analysis_history(user_id)"
-        )
         existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(deep_analysis_history)")}
         if existing_cols and "user_id" not in existing_cols:
             conn.execute("ALTER TABLE deep_analysis_history ADD COLUMN user_id INTEGER REFERENCES users(id)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_history_user ON deep_analysis_history(user_id)"
+        )
 
 
 _init_history_schema()
@@ -2850,7 +2912,7 @@ _paper_settings: dict[str, Any] = {
     "telegram_on_close": True,
     "telegram_on_error": True,
     "telegram_on_high_probability": True,
-    "telegram_high_probability_threshold": 85,
+    "telegram_high_probability_threshold": 70,
     "telegram_daily_summary": False,
 }
 
@@ -3269,9 +3331,9 @@ def _init_user_schema() -> None:
             """
             CREATE TABLE IF NOT EXISTS user_paper_settings (
                 user_id                          INTEGER PRIMARY KEY,
-                auto_trade_enabled               INTEGER NOT NULL DEFAULT 0,
-                auto_trade_threshold             REAL    NOT NULL DEFAULT 90.0,
-                auto_trade_market_open_only      INTEGER NOT NULL DEFAULT 1,
+                auto_trade_enabled               INTEGER NOT NULL DEFAULT 1,
+                auto_trade_threshold             REAL    NOT NULL DEFAULT 70.0,
+                auto_trade_market_open_only      INTEGER NOT NULL DEFAULT 0,
                 starting_capital                 REAL    NOT NULL DEFAULT 1000000,
                 risk_per_trade_pct               REAL    NOT NULL DEFAULT 1.0,
                 max_open_positions               INTEGER NOT NULL DEFAULT 5,
@@ -3280,12 +3342,24 @@ def _init_user_schema() -> None:
                 telegram_on_close                INTEGER NOT NULL DEFAULT 1,
                 telegram_on_error                INTEGER NOT NULL DEFAULT 1,
                 telegram_on_high_probability     INTEGER NOT NULL DEFAULT 1,
-                telegram_high_probability_threshold INTEGER NOT NULL DEFAULT 85,
+                telegram_high_probability_threshold INTEGER NOT NULL DEFAULT 70,
                 telegram_daily_summary           INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             )
             """
         )
+        # Migrate user_paper_settings — add TSL + partial exit columns
+        ups_cols = {row[1] for row in conn.execute("PRAGMA table_info(user_paper_settings)")}
+        for col, typedef in [
+            ("sl_mode", "TEXT NOT NULL DEFAULT 'fixed'"),
+            ("atr_multiplier", "REAL NOT NULL DEFAULT 1.5"),
+            ("trailing_activation_pct", "REAL NOT NULL DEFAULT 1.0"),
+            ("partial_exit_enabled", "INTEGER NOT NULL DEFAULT 0"),
+            ("partial_exit_ratio", "REAL NOT NULL DEFAULT 50.0"),
+        ]:
+            if ups_cols and col not in ups_cols:
+                conn.execute(f"ALTER TABLE user_paper_settings ADD COLUMN {col} {typedef}")
+
         # Add user_id column to paper_trades if missing (safe migration).
         # Guard with `existing_cols` so we skip on a fresh DB where the table
         # doesn't exist yet — _init_paper_schema() creates it right after.
@@ -3323,7 +3397,7 @@ def _init_user_schema() -> None:
                 )
             # Ensure admin has a paper settings row
             conn.execute(
-                "INSERT OR IGNORE INTO user_paper_settings (user_id) VALUES (?)", (admin_id,)
+                "INSERT OR IGNORE INTO user_paper_settings (user_id) VALUES (?)", (admin_id,)  # admin bootstrap — keep simple
             )
 
 
@@ -3387,6 +3461,23 @@ def _init_paper_schema() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_paper_orders_trade ON paper_orders(trade_id)"
         )
+        # Migrate paper_trades — add TSL + partial exit columns
+        pt_cols = {row[1] for row in conn.execute("PRAGMA table_info(paper_trades)")}
+        for col, typedef in [
+            ("sl_mode", "TEXT NOT NULL DEFAULT 'fixed'"),
+            ("highest_price", "REAL"),
+            ("trailing_sl", "REAL"),
+            ("trailing_activated", "INTEGER NOT NULL DEFAULT 0"),
+            ("original_stop", "REAL"),
+            ("atr_at_entry", "REAL"),
+            ("partial_exit_done", "INTEGER NOT NULL DEFAULT 0"),
+            ("partial_exit_qty", "INTEGER"),
+            ("partial_exit_price", "REAL"),
+            ("target2_price", "REAL"),
+            ("remaining_qty", "INTEGER"),
+        ]:
+            if pt_cols and col not in pt_cols:
+                conn.execute(f"ALTER TABLE paper_trades ADD COLUMN {col} {typedef}")
 
 
 _init_paper_schema()
@@ -3488,6 +3579,17 @@ _init_broker_schema()
 def _row_to_trade_dict(row: sqlite3.Row) -> dict[str, Any]:
     d = dict(row)
     d["status"] = d["status"].upper()
+    d.setdefault("sl_mode", "fixed")
+    d.setdefault("highest_price", None)
+    d.setdefault("trailing_sl", None)
+    d.setdefault("trailing_activated", 0)
+    d.setdefault("original_stop", d.get("stop_loss"))
+    d.setdefault("atr_at_entry", None)
+    d.setdefault("partial_exit_done", 0)
+    d.setdefault("partial_exit_qty", None)
+    d.setdefault("partial_exit_price", None)
+    d.setdefault("target2_price", None)
+    d.setdefault("remaining_qty", d.get("quantity"))
     return d
 
 
@@ -3506,6 +3608,22 @@ def _fetch_open_trade_for_symbol_sync(symbol: str, user_id: Optional[int] = None
     return _row_to_trade_dict(row) if row else None
 
 
+def _fetch_active_trade_for_symbol_sync(symbol: str, user_id: Optional[int] = None) -> Optional[dict[str, Any]]:
+    """Find any OPEN or PENDING trade for a symbol (dedup guard)."""
+    with _db_connect() as conn:
+        if user_id is not None:
+            row = conn.execute(
+                "SELECT * FROM paper_trades WHERE symbol=? AND status IN ('OPEN','PENDING') AND user_id=? ORDER BY id DESC LIMIT 1",
+                (symbol.upper(), user_id),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM paper_trades WHERE symbol=? AND status IN ('OPEN','PENDING') ORDER BY id DESC LIMIT 1",
+                (symbol.upper(),),
+            ).fetchone()
+    return _row_to_trade_dict(row) if row else None
+
+
 def _count_open_positions_sync(user_id: Optional[int] = None) -> int:
     with _db_connect() as conn:
         if user_id is not None:
@@ -3514,6 +3632,18 @@ def _count_open_positions_sync(user_id: Optional[int] = None) -> int:
             ).fetchone()
         else:
             row = conn.execute("SELECT COUNT(*) AS n FROM paper_trades WHERE status='OPEN'").fetchone()
+    return int(row["n"] if row else 0)
+
+
+def _count_active_positions_sync(user_id: Optional[int] = None) -> int:
+    """Count OPEN + PENDING trades (both occupy a slot)."""
+    with _db_connect() as conn:
+        if user_id is not None:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM paper_trades WHERE status IN ('OPEN','PENDING') AND user_id=?", (user_id,)
+            ).fetchone()
+        else:
+            row = conn.execute("SELECT COUNT(*) AS n FROM paper_trades WHERE status IN ('OPEN','PENDING')").fetchone()
     return int(row["n"] if row else 0)
 
 
@@ -3584,45 +3714,58 @@ def _fetch_trade_sync(trade_id: int, user_id: Optional[int] = None) -> Optional[
     return trade
 
 
-def _insert_trade_sync(trade: dict[str, Any], user_id: Optional[int] = None) -> int:
-    """Insert an OPEN trade and its BUY order atomically."""
+def _insert_trade_sync(trade: dict[str, Any], user_id: Optional[int] = None, status: str = "OPEN") -> int:
+    """Insert a trade. OPEN trades get an immediate BUY order; PENDING trades wait for entry fill."""
+    now = trade.get("opened_at") or _now_iso()
+    entry = float(trade["entry_price"])
+    qty = int(trade["quantity"])
     with _db_lock, _db_connect() as conn:
         cursor = conn.execute(
             """
             INSERT INTO paper_trades (
                 symbol, exchange, status, entry_price, stop_loss, target_price,
                 quantity, risk_amount, opened_at, max_hold_days, source,
-                history_id, combined_score, notes, last_price, last_marked_at, user_id
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                history_id, combined_score, notes, last_price, last_marked_at, user_id,
+                sl_mode, highest_price, original_stop, atr_at_entry,
+                target2_price, remaining_qty
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, ?,?,?,?, ?,?)
             """,
             (
                 trade["symbol"].upper(),
                 trade.get("exchange", "NSE"),
-                "OPEN",
-                float(trade["entry_price"]),
+                status,
+                entry,
                 float(trade["stop_loss"]),
                 float(trade["target_price"]),
-                int(trade["quantity"]),
+                qty,
                 float(trade["risk_amount"]),
-                trade.get("opened_at") or _now_iso(),
+                now,
                 int(trade.get("max_hold_days", PAPER_MAX_HOLD_DAYS)),
                 trade.get("source", "manual"),
                 trade.get("history_id"),
                 trade.get("combined_score"),
                 trade.get("notes"),
-                float(trade["entry_price"]),
-                trade.get("opened_at") or _now_iso(),
+                entry,
+                now,
                 user_id,
+                trade.get("sl_mode", "fixed"),
+                entry,
+                float(trade["stop_loss"]),
+                trade.get("atr_at_entry"),
+                trade.get("target2_price"),
+                qty,
             ),
         )
         tid = int(cursor.lastrowid or 0)
-        conn.execute(
-            """
-            INSERT INTO paper_orders (trade_id, side, reason, price, quantity, executed_at)
-            VALUES (?,?,?,?,?,?)
-            """,
-            (tid, "BUY", "OPEN", float(trade["entry_price"]), int(trade["quantity"]), trade.get("opened_at") or _now_iso()),
-        )
+        if status == "OPEN":
+            conn.execute(
+                """
+                INSERT INTO paper_orders (trade_id, side, reason, price, quantity, executed_at)
+                VALUES (?,?,?,?,?,?)
+                """,
+                (tid, "BUY", "OPEN", entry, qty, now),
+            )
+    _db_backup()
     return tid
 
 
@@ -3641,8 +3784,12 @@ def _close_trade_sync(
             return None
         entry = float(row["entry_price"])
         qty = int(row["quantity"])
-        pnl = (float(close_price) - entry) * qty
-        pnl_pct = (float(close_price) - entry) / entry * 100 if entry else 0.0
+        remaining = int(row["remaining_qty"]) if row["remaining_qty"] is not None else qty
+        partial_booked = 0.0
+        if row["partial_exit_done"] and row["partial_exit_qty"] and row["partial_exit_price"]:
+            partial_booked = (float(row["partial_exit_price"]) - entry) * int(row["partial_exit_qty"])
+        pnl = (float(close_price) - entry) * remaining + partial_booked
+        pnl_pct = pnl / (entry * qty) * 100 if entry and qty else 0.0
         conn.execute(
             """
             UPDATE paper_trades
@@ -3672,17 +3819,94 @@ def _close_trade_sync(
             INSERT INTO paper_orders (trade_id, side, reason, price, quantity, executed_at)
             VALUES (?,?,?,?,?,?)
             """,
-            (int(trade_id), "SELL", exit_reason, float(close_price), qty, closed_at),
+            (int(trade_id), "SELL", exit_reason, float(close_price), remaining, closed_at),
         )
+    _db_backup()
     return _fetch_trade_sync(trade_id)
 
 
 def _mark_trade_price_sync(trade_id: int, price: float) -> None:
     with _db_lock, _db_connect() as conn:
         conn.execute(
-            "UPDATE paper_trades SET last_price=?, last_marked_at=? WHERE id=? AND status='OPEN'",
+            "UPDATE paper_trades SET last_price=?, last_marked_at=? WHERE id=? AND status IN ('OPEN','PENDING')",
             (float(price), _now_iso(), int(trade_id)),
         )
+
+
+def _cancel_pending_trade_sync(trade_id: int) -> None:
+    with _db_lock, _db_connect() as conn:
+        conn.execute(
+            "UPDATE paper_trades SET status='CANCELLED' WHERE id=? AND status='PENDING'",
+            (int(trade_id),),
+        )
+
+
+def _activate_pending_trade_sync(trade_id: int, fill_price: float) -> Optional[dict[str, Any]]:
+    """Convert a PENDING trade to OPEN and create the BUY order at fill_price."""
+    now = _now_iso()
+    with _db_lock, _db_connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM paper_trades WHERE id=? AND status='PENDING'", (int(trade_id),)
+        ).fetchone()
+        if row is None:
+            return None
+        conn.execute(
+            "UPDATE paper_trades SET status='OPEN', opened_at=?, last_price=?, last_marked_at=? WHERE id=?",
+            (now, float(fill_price), now, int(trade_id)),
+        )
+        conn.execute(
+            "INSERT INTO paper_orders (trade_id, side, reason, price, quantity, executed_at) VALUES (?,?,?,?,?,?)",
+            (int(trade_id), "BUY", "OPEN", float(fill_price), int(row["quantity"]), now),
+        )
+    return _fetch_trade_sync(trade_id)
+
+
+def _update_trailing_sl_sync(
+    trade_id: int, highest: float, trailing_sl: float, activated: bool
+) -> None:
+    with _db_lock, _db_connect() as conn:
+        conn.execute(
+            """UPDATE paper_trades
+               SET highest_price=?, trailing_sl=?, trailing_activated=?, stop_loss=?
+               WHERE id=? AND status='OPEN'""",
+            (float(highest), float(trailing_sl), 1 if activated else 0,
+             float(trailing_sl), int(trade_id)),
+        )
+
+
+def _partial_close_trade_sync(
+    trade_id: int, close_price: float, partial_qty: int, exit_reason: str = "PARTIAL_TARGET"
+) -> Optional[dict[str, Any]]:
+    """Sell a portion of the position, move SL to entry (cost-to-cost)."""
+    now = _now_iso()
+    with _db_lock, _db_connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM paper_trades WHERE id = ? AND status = 'OPEN'", (int(trade_id),)
+        ).fetchone()
+        if row is None:
+            return None
+        entry = float(row["entry_price"])
+        current_remaining = int(row.get("remaining_qty") or row["quantity"])
+        sell_qty = min(partial_qty, current_remaining)
+        new_remaining = current_remaining - sell_qty
+        conn.execute(
+            "INSERT INTO paper_orders (trade_id, side, reason, price, quantity, executed_at) VALUES (?,?,?,?,?,?)",
+            (int(trade_id), "SELL", exit_reason, float(close_price), sell_qty, now),
+        )
+        conn.execute(
+            """UPDATE paper_trades
+               SET partial_exit_done=1, partial_exit_qty=?, partial_exit_price=?,
+                   remaining_qty=?, stop_loss=?, original_stop=COALESCE(original_stop, stop_loss),
+                   last_price=?, last_marked_at=?
+               WHERE id=?""",
+            (sell_qty, float(close_price), new_remaining,
+             entry, float(close_price), now, int(trade_id)),
+        )
+    return _fetch_trade_sync(trade_id)
+
+
+EXIT_PARTIAL = "PARTIAL_TARGET"
+EXIT_TARGET2 = "TARGET2_HIT"
 
 
 # ---- Sizing --------------------------------------------------------------
@@ -3751,9 +3975,9 @@ def _paper_settings_update(updates: dict[str, Any]) -> dict[str, Any]:
 
 
 _PAPER_SETTINGS_DEFAULTS: dict[str, Any] = {
-    "auto_trade_enabled": False,
-    "auto_trade_threshold": 90.0,
-    "auto_trade_market_open_only": True,
+    "auto_trade_enabled": True,
+    "auto_trade_threshold": 70.0,
+    "auto_trade_market_open_only": False,
     "starting_capital": 1_000_000.0,
     "risk_per_trade_pct": 1.0,
     "max_open_positions": 5,
@@ -3762,9 +3986,52 @@ _PAPER_SETTINGS_DEFAULTS: dict[str, Any] = {
     "telegram_on_close": True,
     "telegram_on_error": True,
     "telegram_on_high_probability": True,
-    "telegram_high_probability_threshold": 85,
+    "telegram_high_probability_threshold": 70,
     "telegram_daily_summary": False,
+    "sl_mode": "fixed",
+    "atr_multiplier": 1.5,
+    "trailing_activation_pct": 1.0,
+    "partial_exit_enabled": False,
+    "partial_exit_ratio": 50.0,
 }
+
+
+def _ensure_user_paper_settings(conn, user_id: int) -> None:
+    """Create a settings row for a user with correct Python defaults (not SQL column defaults)."""
+    existing = conn.execute("SELECT 1 FROM user_paper_settings WHERE user_id=?", (user_id,)).fetchone()
+    if existing:
+        return
+    d = _PAPER_SETTINGS_DEFAULTS
+    conn.execute(
+        """INSERT INTO user_paper_settings (
+            user_id, auto_trade_enabled, auto_trade_threshold, auto_trade_market_open_only,
+            starting_capital, risk_per_trade_pct, max_open_positions, max_hold_days,
+            telegram_on_open, telegram_on_close, telegram_on_error,
+            telegram_on_high_probability, telegram_high_probability_threshold, telegram_daily_summary,
+            sl_mode, atr_multiplier, trailing_activation_pct, partial_exit_enabled, partial_exit_ratio
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            user_id,
+            1 if d["auto_trade_enabled"] else 0,
+            d["auto_trade_threshold"],
+            1 if d["auto_trade_market_open_only"] else 0,
+            d["starting_capital"],
+            d["risk_per_trade_pct"],
+            d["max_open_positions"],
+            d["max_hold_days"],
+            1 if d["telegram_on_open"] else 0,
+            1 if d["telegram_on_close"] else 0,
+            1 if d["telegram_on_error"] else 0,
+            1 if d["telegram_on_high_probability"] else 0,
+            d["telegram_high_probability_threshold"],
+            1 if d["telegram_daily_summary"] else 0,
+            d["sl_mode"],
+            d["atr_multiplier"],
+            d["trailing_activation_pct"],
+            1 if d["partial_exit_enabled"] else 0,
+            d["partial_exit_ratio"],
+        ),
+    )
 
 
 def _get_user_paper_settings(user_id: int) -> dict[str, Any]:
@@ -3774,23 +4041,27 @@ def _get_user_paper_settings(user_id: int) -> dict[str, Any]:
             "SELECT * FROM user_paper_settings WHERE user_id=?", (user_id,)
         ).fetchone()
     if row is None:
-        # Auto-create default row for this user
         with _db_lock, _db_connect() as conn:
-            conn.execute(
-                "INSERT OR IGNORE INTO user_paper_settings (user_id) VALUES (?)", (user_id,)
-            )
+            _ensure_user_paper_settings(conn, user_id)
         return dict(_PAPER_SETTINGS_DEFAULTS)
     settings = dict(_PAPER_SETTINGS_DEFAULTS)
+    _bool_keys = {
+        "auto_trade_enabled", "auto_trade_market_open_only",
+        "telegram_on_open", "telegram_on_close", "telegram_on_error",
+        "telegram_on_high_probability", "telegram_daily_summary",
+        "partial_exit_enabled",
+    }
+    _int_keys = {"max_open_positions", "max_hold_days", "telegram_high_probability_threshold"}
+    _str_keys = {"sl_mode"}
     for k in settings:
         col_val = row[k] if k in row.keys() else None
         if col_val is not None:
-            if k in {"auto_trade_enabled", "auto_trade_market_open_only",
-                     "telegram_on_open", "telegram_on_close", "telegram_on_error",
-                     "telegram_on_high_probability", "telegram_daily_summary"}:
+            if k in _bool_keys:
                 settings[k] = bool(col_val)
-            elif k in {"max_open_positions", "max_hold_days",
-                       "telegram_high_probability_threshold"}:
+            elif k in _int_keys:
                 settings[k] = int(col_val)
+            elif k in _str_keys:
+                settings[k] = str(col_val)
             else:
                 settings[k] = float(col_val)
     return settings
@@ -3801,18 +4072,21 @@ def _update_user_paper_settings(user_id: int, updates: dict[str, Any]) -> dict[s
         "auto_trade_enabled", "auto_trade_market_open_only",
         "telegram_on_open", "telegram_on_close", "telegram_on_error",
         "telegram_on_high_probability", "telegram_daily_summary",
+        "partial_exit_enabled",
     }
     allowed_int = {
         "max_open_positions", "max_hold_days", "telegram_high_probability_threshold",
     }
-    allowed_float = {"risk_per_trade_pct", "starting_capital", "auto_trade_threshold"}
-    allowed = allowed_bool | allowed_int | allowed_float
+    allowed_float = {
+        "risk_per_trade_pct", "starting_capital", "auto_trade_threshold",
+        "atr_multiplier", "trailing_activation_pct", "partial_exit_ratio",
+    }
+    allowed_str = {"sl_mode"}
+    allowed = allowed_bool | allowed_int | allowed_float | allowed_str
 
     # Ensure row exists
     with _db_lock, _db_connect() as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO user_paper_settings (user_id) VALUES (?)", (user_id,)
-        )
+        _ensure_user_paper_settings(conn, user_id)
         for k, v in updates.items():
             if k not in allowed:
                 continue
@@ -3820,6 +4094,8 @@ def _update_user_paper_settings(user_id: int, updates: dict[str, Any]) -> dict[s
                 v = 1 if v else 0
             elif k in allowed_int:
                 v = int(v)
+            elif k in allowed_str:
+                v = str(v)
             else:
                 v = float(v)
             conn.execute(
@@ -3857,6 +4133,8 @@ async def open_paper_trade(
     combined_score: Optional[int] = None,
     exchange: str = "NSE",
     notes: Optional[str] = None,
+    atr_at_entry: Optional[float] = None,
+    target2_price: Optional[float] = None,
 ) -> dict[str, Any]:
     settings = _get_user_paper_settings(user_id) if user_id else _paper_settings_snapshot()
 
@@ -3866,14 +4144,14 @@ async def open_paper_trade(
             "Invalid levels: require stop_loss < entry_price < target_price."
         )
 
-    # Dedup — one OPEN position per symbol per user.
-    existing = await asyncio.to_thread(_fetch_open_trade_for_symbol_sync, symbol.upper(), user_id)
+    # Dedup — one OPEN or PENDING position per symbol per user.
+    existing = await asyncio.to_thread(_fetch_active_trade_for_symbol_sync, symbol.upper(), user_id)
     if existing:
         raise PaperTradeError(
-            f"An open position for {symbol.upper()} already exists (#{existing['id']})."
+            f"An {'open' if existing['status'] == 'OPEN' else 'pending'} position for {symbol.upper()} already exists (#{existing['id']})."
         )
 
-    open_count = await asyncio.to_thread(_count_open_positions_sync, user_id)
+    open_count = await asyncio.to_thread(_count_active_positions_sync, user_id)
     if open_count >= settings["max_open_positions"]:
         raise PaperTradeError(
             f"Max open positions reached ({open_count}/{settings['max_open_positions']})."
@@ -3890,6 +4168,18 @@ async def open_paper_trade(
             "Computed quantity is zero — risk too small or stop too far. Check levels."
         )
 
+    effective_atr = atr_at_entry or max((entry_price - stop_loss) / 1.5, entry_price * 0.005)
+
+    current_price: Optional[float] = None
+    try:
+        live = await asyncio.to_thread(_fetch_live_stock_data, symbol, exchange)
+        current_price = float(live["price"])
+    except Exception:
+        pass
+
+    fill_now = current_price is not None and current_price <= entry_price
+    trade_status = "OPEN" if fill_now else "PENDING"
+
     payload = {
         "symbol": symbol,
         "exchange": exchange,
@@ -3903,11 +4193,15 @@ async def open_paper_trade(
         "combined_score": combined_score,
         "notes": notes,
         "opened_at": _now_iso(),
+        "sl_mode": settings.get("sl_mode", "fixed"),
+        "atr_at_entry": effective_atr,
+        "target2_price": target2_price,
     }
-    tid = await asyncio.to_thread(_insert_trade_sync, payload, user_id)
+    tid = await asyncio.to_thread(_insert_trade_sync, payload, user_id, trade_status)
     logger.info(
-        "Paper trade #%d OPEN %s qty=%d entry=%.2f stop=%.2f target=%.2f risk=₹%.0f source=%s user=%s",
-        tid, symbol.upper(), qty, entry_price, stop_loss, target_price, risk_rupees, source, user_id,
+        "Paper trade #%d %s %s qty=%d entry=%.2f (mkt=%.2f) stop=%.2f target=%.2f risk=₹%.0f sl_mode=%s user=%s",
+        tid, trade_status, symbol.upper(), qty, entry_price,
+        current_price or 0.0, stop_loss, target_price, risk_rupees, payload["sl_mode"], user_id,
     )
     return await asyncio.to_thread(_fetch_trade_sync, tid)
 
@@ -4018,6 +4312,8 @@ async def maybe_auto_paper_trade(
             history_id=history_id,
             combined_score=score,
             notes=" | ".join(note_parts),
+            atr_at_entry=float(levels.get("atr") or 0) or None,
+            target2_price=float(levels.get("target_2") or 0) or None,
         )
         meta["reason"] = (
             "Auto-trade opened."
@@ -4123,22 +4419,52 @@ async def paper_portfolio_snapshot() -> dict[str, Any]:
 
 
 async def _monitor_open_positions_once() -> dict[str, Any]:
-    """Evaluate exits for every OPEN position. Returns {closed, skipped_market_closed, market_status}."""
-    open_trades = await asyncio.to_thread(_list_trades_sync, "OPEN", None, 500)
-    closed = 0
-    settings = _paper_settings_snapshot()
-    max_hold = int(settings["max_hold_days"])
+    """Evaluate pending fills and exits for all active positions."""
     market = get_market_status()
     market_is_open = bool(market["is_open"])
+    settings = _paper_settings_snapshot()
+    max_hold = int(settings["max_hold_days"])
+    activated = 0
+    closed = 0
 
+    # --- Phase 1: check PENDING trades for entry fill ---
+    pending_trades = await asyncio.to_thread(_list_trades_sync, "PENDING", None, 500)
+    for t in pending_trades:
+        sym = t["symbol"]
+        try:
+            data = await asyncio.to_thread(_fetch_live_stock_data, sym, t.get("exchange", "NSE"))
+        except Exception:
+            continue
+        price = float(data["price"])
+        await asyncio.to_thread(_mark_trade_price_sync, int(t["id"]), price)
+        entry = float(t["entry_price"])
+        if market_is_open and price <= entry:
+            result = await asyncio.to_thread(_activate_pending_trade_sync, int(t["id"]), entry)
+            if result:
+                activated += 1
+                logger.info("PENDING trade #%d %s filled at entry %.2f (mkt=%.2f)", t["id"], sym, entry, price)
+                try:
+                    asyncio.create_task(telegram_send_trade_opened(result))
+                except Exception:
+                    pass
+        # Cancel stale pending orders
+        try:
+            created = datetime.fromisoformat(t["opened_at"].replace("Z", "+00:00"))
+        except Exception:
+            created = datetime.now(timezone.utc)
+        if (datetime.now(timezone.utc) - created).days >= max_hold:
+            await asyncio.to_thread(_cancel_pending_trade_sync, int(t["id"]))
+            logger.info("PENDING trade #%d %s cancelled — exceeded max hold days", t["id"], sym)
+
+    # --- Phase 2: check OPEN trades for TSL update + stop/target/time exit ---
+    open_trades = await asyncio.to_thread(_list_trades_sync, "OPEN", None, 500)
     for t in open_trades:
         sym = t["symbol"]
         try:
             data = await asyncio.to_thread(_fetch_live_stock_data, sym, t.get("exchange", "NSE"))
-            _telegram_failure_counts[sym] = 0  # reset on success
+            _telegram_failure_counts[sym] = 0
         except Exception as exc:
             logger.debug("Monitor fetch failed for %s: %s", sym, exc)
-            # Alert after 3 consecutive failures for the same symbol.
             _telegram_failure_counts[sym] = _telegram_failure_counts.get(sym, 0) + 1
             if _telegram_failure_counts[sym] >= 3:
                 try:
@@ -4151,20 +4477,50 @@ async def _monitor_open_positions_once() -> dict[str, Any]:
         price = float(data["price"])
         await asyncio.to_thread(_mark_trade_price_sync, int(t["id"]), price)
 
+        entry = float(t["entry_price"])
         stop = float(t["stop_loss"])
         target = float(t["target_price"])
 
-        # Intraday SL/TARGET evaluation only when the NSE regular session is live.
-        # Outside market hours the "live" price is the last session close — evaluating
-        # stops/targets against a stale bar produces false exits, especially on aftermarket-opened trades.
+        # --- Trailing Stop Loss logic ---
+        sl_mode = t.get("sl_mode", "fixed")
+        if sl_mode in ("trailing", "hybrid") and market_is_open:
+            highest = float(t.get("highest_price") or entry)
+            atr = float(t.get("atr_at_entry") or max((entry - float(t.get("original_stop") or stop)) / 1.5, entry * 0.005))
+            multiplier = float(settings.get("atr_multiplier", 1.5))
+            activation_pct = float(settings.get("trailing_activation_pct", 1.0))
+            trailing_active = bool(t.get("trailing_activated", 0))
+
+            if price > highest:
+                highest = price
+
+            if sl_mode == "trailing":
+                trailing_active = True
+            elif sl_mode == "hybrid":
+                profit_pct = (price - entry) / entry * 100
+                if profit_pct >= activation_pct:
+                    trailing_active = True
+
+            if trailing_active:
+                new_tsl = highest - (atr * multiplier)
+                original = float(t.get("original_stop") or stop)
+                effective_stop = max(new_tsl, original)
+                await asyncio.to_thread(
+                    _update_trailing_sl_sync, int(t["id"]), highest, effective_stop, True
+                )
+                stop = effective_stop
+            else:
+                if price > highest:
+                    await asyncio.to_thread(_mark_trade_price_sync, int(t["id"]), price)
+
         if market_is_open:
-            hit_stop = price <= stop
-            hit_target = price >= target
-            if hit_stop:
+            # --- Stop loss check ---
+            if price <= stop:
                 await close_paper_trade(int(t["id"]), price=stop, reason=EXIT_SL)
                 closed += 1
                 continue
-            if hit_target:
+
+            # --- Target exit ---
+            if price >= target:
                 await close_paper_trade(int(t["id"]), price=target, reason=EXIT_TARGET)
                 closed += 1
                 continue
@@ -4182,6 +4538,8 @@ async def _monitor_open_positions_once() -> dict[str, Any]:
     return {
         "closed": closed,
         "evaluated": len(open_trades),
+        "pending_evaluated": len(pending_trades),
+        "activated": activated,
         "market_status": market["status"],
         "market_open": market_is_open,
         "sl_target_checks_skipped": (not market_is_open) and len(open_trades) > 0,
@@ -4457,6 +4815,7 @@ async def api_info() -> dict[str, Any]:
             "POST /paper-trades",
             "GET /paper-trades/{id}",
             "POST /paper-trades/{id}/close",
+            "PATCH /paper-trades/{id}/sl",
             "POST /paper-trades/monitor-now",
             "GET /telegram-status",
             "POST /telegram-test",
@@ -4496,6 +4855,20 @@ async def root() -> dict[str, Any]:
 @app.get("/health")
 async def health() -> dict[str, Any]:
     return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
+@app.post("/admin/backup-db")
+async def admin_backup_db(user: dict = Depends(get_current_user)) -> dict[str, Any]:
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Admin only.")
+    import shutil
+    try:
+        shutil.copy2(DB_PATH, _DB_BACKUP_PATH)
+        size = _DB_BACKUP_PATH.stat().st_size
+        logger.info("Manual DB backup by admin: %d bytes", size)
+        return {"ok": True, "backup_path": str(_DB_BACKUP_PATH), "size_bytes": size}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Backup failed: {exc}") from exc
 
 
 # ---- Secrets-vault endpoints --------------------------------------------
@@ -4604,10 +4977,9 @@ async def auth_register(req: AuthRegisterRequest) -> dict[str, Any]:
         user_id = conn.execute(
             "SELECT id FROM users WHERE username=?", (req.username,)
         ).fetchone()["id"]
-        conn.execute(
-            "INSERT OR IGNORE INTO user_paper_settings (user_id) VALUES (?)", (user_id,)
-        )
+        _ensure_user_paper_settings(conn, user_id)
     logger.info("New user registered: %s (id=%d, admin=%s)", req.username, user_id, bool(is_admin))
+    _db_backup()
     return {"ok": True, **_issue_user_token(user_id, req.username, bool(is_admin))}
 
 
@@ -5065,6 +5437,13 @@ async def deep_analyze_endpoint(
     market = get_market_status()
     result = {**result, "market_status": market}
 
+    # Attach news sentiment so the UI can show it alongside the analysis.
+    try:
+        news = await asyncio.to_thread(_fetch_news_sentiment_sync, symbol)
+        result = {**result, "news_sentiment": news}
+    except Exception:
+        pass
+
     # Auto paper-trade hook: opens a trade if settings allow and score ≥ threshold.
     try:
         auto_trade, auto_meta = await maybe_auto_paper_trade(symbol, result, history_id=history_id, user_id=user["user_id"])
@@ -5105,6 +5484,10 @@ class PaperCloseRequest(BaseModel):
     reason: str = Field(default="MANUAL_CLOSE")
 
 
+class PaperUpdateSLRequest(BaseModel):
+    stop_loss: float = Field(..., gt=0)
+
+
 class PaperSettingsUpdate(BaseModel):
     auto_trade_enabled: Optional[bool] = None
     auto_trade_threshold: Optional[int] = Field(default=None, ge=0, le=100)
@@ -5118,6 +5501,191 @@ class PaperSettingsUpdate(BaseModel):
     telegram_on_high_probability: Optional[bool] = None
     telegram_high_probability_threshold: Optional[int] = Field(default=None, ge=0, le=100)
     telegram_daily_summary: Optional[bool] = None
+    sl_mode: Optional[str] = Field(default=None, pattern=r"^(fixed|trailing|hybrid)$")
+    atr_multiplier: Optional[float] = Field(default=None, gt=0, le=10)
+    trailing_activation_pct: Optional[float] = Field(default=None, ge=0, le=50)
+
+
+# ---------------------------------------------------------------------------
+# Dashboard summary
+# ---------------------------------------------------------------------------
+
+
+def _dashboard_summary_sync(user_id: int) -> dict[str, Any]:
+    settings = _get_user_paper_settings(user_id)
+    starting_capital = float(settings["starting_capital"])
+
+    with _db_connect() as conn:
+        realised_row = conn.execute(
+            "SELECT COALESCE(SUM(pnl_amount), 0) AS total FROM paper_trades WHERE status='CLOSED' AND user_id=?",
+            (user_id,),
+        ).fetchone()
+        realised = float(realised_row["total"])
+
+        open_count = int(conn.execute(
+            "SELECT COUNT(*) AS n FROM paper_trades WHERE status='OPEN' AND user_id=?", (user_id,)
+        ).fetchone()["n"])
+        pending_count = int(conn.execute(
+            "SELECT COUNT(*) AS n FROM paper_trades WHERE status='PENDING' AND user_id=?", (user_id,)
+        ).fetchone()["n"])
+
+        today_str = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
+        todays_pnl = float(conn.execute(
+            "SELECT COALESCE(SUM(pnl_amount), 0) AS t FROM paper_trades WHERE status='CLOSED' AND user_id=? AND closed_at LIKE ?",
+            (user_id, f"{today_str}%"),
+        ).fetchone()["t"])
+
+        stats_row = conn.execute(
+            """SELECT
+                 COUNT(*) AS n_closed,
+                 SUM(CASE WHEN pnl_amount > 0 THEN 1 ELSE 0 END) AS n_wins,
+                 AVG(pnl_pct) AS avg_pnl_pct,
+                 MIN(pnl_amount) AS worst_amt, MAX(pnl_amount) AS best_amt,
+                 MIN(pnl_pct) AS worst_pct, MAX(pnl_pct) AS best_pct
+               FROM (
+                 SELECT pnl_amount, pnl_pct FROM paper_trades
+                 WHERE status='CLOSED' AND user_id=?
+                 ORDER BY closed_at DESC LIMIT 50
+               )""",
+            (user_id,),
+        ).fetchone()
+
+        equity_rows = conn.execute(
+            "SELECT pnl_amount FROM paper_trades WHERE status='CLOSED' AND user_id=? ORDER BY closed_at ASC",
+            (user_id,),
+        ).fetchall()
+
+        open_trades = conn.execute(
+            "SELECT entry_price, last_price, quantity, remaining_qty FROM paper_trades WHERE status='OPEN' AND user_id=?",
+            (user_id,),
+        ).fetchall()
+
+    peak = starting_capital
+    max_dd = 0.0
+    equity = starting_capital
+    for row in equity_rows:
+        equity += float(row["pnl_amount"] or 0)
+        if equity > peak:
+            peak = equity
+        dd = (equity - peak) / peak * 100 if peak > 0 else 0
+        if dd < max_dd:
+            max_dd = dd
+
+    unrealised = sum(
+        (float(t["last_price"] or t["entry_price"]) - float(t["entry_price"])) * int(t["remaining_qty"] or t["quantity"])
+        for t in open_trades
+    )
+    total_equity = starting_capital + realised + unrealised
+
+    n_closed = int(stats_row["n_closed"] or 0)
+    n_wins = int(stats_row["n_wins"] or 0)
+    win_rate = round(n_wins / n_closed * 100, 2) if n_closed else 0.0
+
+    return {
+        "totalEquity": round(total_equity, 2),
+        "startingCapital": starting_capital,
+        "realisedPnL": round(realised, 2),
+        "unrealisedPnL": round(unrealised, 2),
+        "todaysPnL": round(todays_pnl, 2),
+        "todaysPnLPct": round(todays_pnl / starting_capital * 100, 2) if starting_capital else 0.0,
+        "openPositionsCount": open_count,
+        "pendingOrdersCount": pending_count,
+        "closedTradesCount": n_closed,
+        "winRate": win_rate,
+        "avgReturnPct": round(float(stats_row["avg_pnl_pct"] or 0), 2),
+        "bestTrade": round(float(stats_row["best_amt"] or 0), 2),
+        "worstTrade": round(float(stats_row["worst_amt"] or 0), 2),
+        "bestTradePct": round(float(stats_row["best_pct"] or 0), 2),
+        "worstTradePct": round(float(stats_row["worst_pct"] or 0), 2),
+        "maxDrawdownPct": round(max_dd, 2),
+        "settings": settings,
+    }
+
+
+@app.get("/dashboard/summary")
+async def dashboard_summary(user: dict = Depends(get_current_user)) -> dict[str, Any]:
+    return await asyncio.to_thread(_dashboard_summary_sync, user["user_id"])
+
+
+# ---------------------------------------------------------------------------
+# News / Sentiment scoring
+# ---------------------------------------------------------------------------
+
+_POSITIVE_WORDS = {
+    "surge", "rally", "bullish", "upgrade", "beat", "profit", "growth",
+    "breakout", "outperform", "strong", "record", "high", "gain", "buy",
+    "expand", "momentum", "dividend", "recovery", "turnaround", "positive",
+}
+_NEGATIVE_WORDS = {
+    "crash", "fall", "bearish", "downgrade", "miss", "loss", "decline",
+    "selloff", "underperform", "weak", "low", "risk", "sell", "warning",
+    "fraud", "debt", "default", "negative", "concern", "investigation",
+}
+
+_sentiment_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+_SENTIMENT_CACHE_TTL = 300
+
+
+def _score_headline(headline: str) -> float:
+    words = set(headline.lower().split())
+    pos = len(words & _POSITIVE_WORDS)
+    neg = len(words & _NEGATIVE_WORDS)
+    total = pos + neg
+    if total == 0:
+        return 0.0
+    return round((pos - neg) / total, 2)
+
+
+def _fetch_news_sentiment_sync(symbol: str) -> dict[str, Any]:
+    try:
+        import feedparser
+    except ImportError:
+        return {"symbol": symbol.upper(), "sentiment_score": 0, "sentiment_label": "Neutral",
+                "article_count": 0, "activity_spike": False, "articles": [], "error": "feedparser not installed"}
+
+    from urllib.parse import quote
+    query = quote(f"{symbol} stock NSE")
+    url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
+    feed = feedparser.parse(url)
+    articles = []
+    scores = []
+    for entry in feed.entries[:15]:
+        title = entry.get("title", "")
+        score = _score_headline(title)
+        scores.append(score)
+        articles.append({
+            "title": title,
+            "published": entry.get("published", ""),
+            "link": entry.get("link", ""),
+            "sentiment_score": score,
+        })
+
+    avg_score = round(sum(scores) / len(scores), 3) if scores else 0.0
+    activity_spike = len(articles) >= 8
+    label = "Bullish" if avg_score > 0.15 else ("Bearish" if avg_score < -0.15 else "Neutral")
+
+    return {
+        "symbol": symbol.upper(),
+        "sentiment_score": avg_score,
+        "sentiment_label": label,
+        "article_count": len(articles),
+        "activity_spike": activity_spike,
+        "articles": articles,
+    }
+
+
+@app.get("/news/sentiment")
+async def news_sentiment(symbol: str, user: dict = Depends(get_current_user)) -> dict[str, Any]:
+    cache_key = symbol.upper()
+    cached = _cache_get(_sentiment_cache, cache_key, _SENTIMENT_CACHE_TTL)
+    if cached is not None:
+        return cached
+    try:
+        result = await asyncio.to_thread(_fetch_news_sentiment_sync, symbol)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"News fetch failed: {exc}") from exc
+    _cache_set(_sentiment_cache, cache_key, result)
+    return result
 
 
 @app.get("/paper-portfolio")
@@ -5129,6 +5697,7 @@ async def paper_portfolio(user: dict = Depends(get_current_user)) -> dict[str, A
     equity = starting_capital + realised
 
     open_trades = await asyncio.to_thread(_list_trades_sync, "OPEN", None, 200, uid)
+    pending_trades = await asyncio.to_thread(_list_trades_sync, "PENDING", None, 200, uid)
     unrealised = 0.0
     marked_positions: list[dict[str, Any]] = []
     for t in open_trades:
@@ -5183,8 +5752,10 @@ async def paper_portfolio(user: dict = Depends(get_current_user)) -> dict[str, A
         },
         "positions": {
             "open_count": len(marked_positions),
+            "pending_count": len(pending_trades),
             "max_open": int(settings["max_open_positions"]),
             "open": marked_positions,
+            "pending": pending_trades,
         },
         "stats": {
             "closed_count": n_closed,
@@ -5261,6 +5832,32 @@ async def close_paper_trade_endpoint(
         return await close_paper_trade(trade_id, price=req.price, reason=req.reason or EXIT_MANUAL)
     except PaperTradeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.patch("/paper-trades/{trade_id}/sl")
+async def update_paper_trade_sl(
+    trade_id: int, req: PaperUpdateSLRequest, user: dict = Depends(get_current_user)
+) -> dict[str, Any]:
+    trade = await asyncio.to_thread(_fetch_trade_sync, trade_id, user["user_id"])
+    if trade is None:
+        raise HTTPException(status_code=404, detail=f"Paper trade {trade_id} not found.")
+    if trade["status"] not in ("OPEN", "PENDING"):
+        raise HTTPException(status_code=400, detail=f"Trade {trade_id} is {trade['status']} — cannot modify SL.")
+    entry = float(trade["entry_price"])
+    if req.stop_loss >= entry:
+        raise HTTPException(status_code=400, detail=f"Stop loss (₹{req.stop_loss:.2f}) must be below entry (₹{entry:.2f}).")
+
+    def _update() -> dict[str, Any]:
+        with _db_lock, _db_connect() as conn:
+            conn.execute(
+                "UPDATE paper_trades SET stop_loss=?, original_stop=? WHERE id=? AND status IN ('OPEN','PENDING')",
+                (float(req.stop_loss), float(req.stop_loss), int(trade_id)),
+            )
+        return _fetch_trade_sync(trade_id)
+
+    updated = await asyncio.to_thread(_update)
+    logger.info("Paper trade #%d SL updated to %.2f by user %s", trade_id, req.stop_loss, user["user_id"])
+    return updated
 
 
 @app.post("/paper-trades/monitor-now")
