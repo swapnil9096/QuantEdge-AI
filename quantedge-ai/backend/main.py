@@ -2451,8 +2451,12 @@ async def deep_analyze(symbol: str, exchange: str = "NSE") -> dict[str, Any]:
         "failures": tech_failures,
     }
 
-    # Levels & R/R
-    entry = indicators["close"]
+    # Levels & R/R — use live price so the paper trade fills at actual market.
+    try:
+        _live = await asyncio.to_thread(_fetch_live_stock_data, symbol, exchange)
+        entry = float(_live["price"])
+    except Exception:
+        entry = indicators["close"]
     atr = max(indicators["atr"], entry * 0.005)
     stop = entry - 1.5 * atr
     target1 = entry + 3.0 * atr
@@ -3948,17 +3952,6 @@ async def open_paper_trade(
             "Computed quantity is zero — risk too small or stop too far. Check levels."
         )
 
-    # Determine if we can fill immediately or must pend as a limit order.
-    current_price: Optional[float] = None
-    try:
-        live = await asyncio.to_thread(_fetch_live_stock_data, symbol, exchange)
-        current_price = float(live["price"])
-    except Exception:
-        pass
-
-    fill_now = current_price is not None and current_price <= entry_price
-    trade_status = "OPEN" if fill_now else "PENDING"
-
     payload = {
         "symbol": symbol,
         "exchange": exchange,
@@ -3973,11 +3966,10 @@ async def open_paper_trade(
         "notes": notes,
         "opened_at": _now_iso(),
     }
-    tid = await asyncio.to_thread(_insert_trade_sync, payload, user_id, trade_status)
+    tid = await asyncio.to_thread(_insert_trade_sync, payload, user_id)
     logger.info(
-        "Paper trade #%d %s %s qty=%d entry=%.2f (mkt=%.2f) stop=%.2f target=%.2f risk=₹%.0f source=%s user=%s",
-        tid, trade_status, symbol.upper(), qty, entry_price,
-        current_price or 0.0, stop_loss, target_price, risk_rupees, source, user_id,
+        "Paper trade #%d OPEN %s qty=%d entry=%.2f stop=%.2f target=%.2f risk=₹%.0f source=%s user=%s",
+        tid, symbol.upper(), qty, entry_price, stop_loss, target_price, risk_rupees, source, user_id,
     )
     return await asyncio.to_thread(_fetch_trade_sync, tid)
 
