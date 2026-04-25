@@ -573,10 +573,15 @@ SECTOR_MAP: dict[str, str] = {
 # FastAPI app
 # ---------------------------------------------------------------------------
 
+_is_prod = os.getenv("APP_ENV") == "production"
+
 app = FastAPI(
     title="QuantEdge AI",
     description="Institutional-grade deep-analysis + AlphaScan + Claude proxy backend.",
     version="2.0.0",
+    docs_url=None if _is_prod else "/docs",
+    redoc_url=None if _is_prod else "/redoc",
+    openapi_url=None if _is_prod else "/openapi.json",
 )
 
 # CORS — always allow all origins.
@@ -599,6 +604,17 @@ app.add_middleware(
     allow_credentials=False,
     expose_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _security_headers(request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    if _is_prod:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
 
 
 @app.middleware("http")
@@ -4719,9 +4735,27 @@ async def _monitor_loop() -> None:
         logger.info("Paper-trade monitor cancelled.")
 
 
+_keep_alive_task: asyncio.Task | None = None
+
+KEEP_ALIVE_INTERVAL = int(os.getenv("KEEP_ALIVE_INTERVAL", "240"))
+
+async def _keep_alive_loop() -> None:
+    """Self-ping every 4 minutes to prevent Render free-tier sleep."""
+    port = int(os.getenv("PORT", "8000"))
+    url = f"http://localhost:{port}/health"
+    async with httpx.AsyncClient(timeout=10) as client:
+        while True:
+            await asyncio.sleep(KEEP_ALIVE_INTERVAL)
+            try:
+                await client.get(url)
+                logger.debug("Keep-alive ping OK")
+            except Exception:
+                pass
+
+
 @app.on_event("startup")
 async def _start_background_tasks() -> None:
-    global _monitor_task, _price_poll_task
+    global _monitor_task, _price_poll_task, _keep_alive_task
 
     # Auto-unlock vault if MASTER_PASSWORD env var is set so API keys
     # (TwelveData, Anthropic, etc.) are available without a manual unlock step.
@@ -4737,11 +4771,14 @@ async def _start_background_tasks() -> None:
         _monitor_task = asyncio.create_task(_monitor_loop())
     if _price_poll_task is None or _price_poll_task.done():
         _price_poll_task = asyncio.create_task(_price_poll_loop())
+    if _keep_alive_task is None or _keep_alive_task.done():
+        _keep_alive_task = asyncio.create_task(_keep_alive_loop())
+        logger.info("Keep-alive self-ping started (every %ds)", KEEP_ALIVE_INTERVAL)
 
 
 @app.on_event("shutdown")
 async def _stop_background_tasks() -> None:
-    for task in (_monitor_task, _price_poll_task):
+    for task in (_monitor_task, _price_poll_task, _keep_alive_task):
         if task and not task.done():
             task.cancel()
             try:
@@ -7114,4 +7151,5 @@ _mount_frontend_if_present()
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=port == 8000)

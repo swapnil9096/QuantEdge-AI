@@ -16,6 +16,7 @@ import { DashboardTab } from './components/DashboardTab.jsx';
 import { AuthScreen } from './components/AuthScreen.jsx';
 import { WelcomeModal } from './components/WelcomeModal.jsx';
 import { useWebSocket } from './hooks/useWebSocket.js';
+import { usePersistedState } from './hooks/usePersistedState.js';
 import {
   installFetchInterceptor, apiAuthMe,
   fetchStockData, fetchBacktest, fetchMLTraining, fetchAIExplanation,
@@ -43,31 +44,31 @@ const TABS = [
 
 export default function App() {
   // ---- Tab -----------------------------------------------------------------
-  const [activeTab, setActiveTab] = useState('dashboard');
+  const [activeTab, setActiveTab] = usePersistedState('activeTab', 'dashboard');
 
   // ---- Scanner state -------------------------------------------------------
-  const [watchlist, setWatchlist] = useState(['RELIANCE', 'TCS', 'HDFCBANK', 'INFY', 'ICICIBANK']);
+  const [watchlist, setWatchlist] = usePersistedState('watchlist', ['RELIANCE', 'TCS', 'HDFCBANK', 'INFY', 'ICICIBANK']);
   const [scanStatus, setScanStatus] = useState({});
-  const [scanData, setScanData] = useState({});
+  const [scanData, setScanData] = usePersistedState('scanData', {});
   const [scanning, setScanning] = useState(false);
-  const [lastScan, setLastScan] = useState(null);
+  const [lastScan, setLastScan] = usePersistedState('lastScan', null);
   const [lastError, setLastError] = useState(null);
 
   // ---- Backtest state ------------------------------------------------------
-  const [backtest, setBacktest] = useState(null);
+  const [backtest, setBacktest] = usePersistedState('backtest', null);
   const [backtestLoading, setBacktestLoading] = useState(false);
 
   // ---- ML state ------------------------------------------------------------
-  const [ml, setMl] = useState(null);
+  const [ml, setMl] = usePersistedState('ml', null);
   const [mlLoading, setMlLoading] = useState(false);
 
   // ---- Insights state ------------------------------------------------------
-  const [activeSymbol, setActiveSymbol] = useState(null);
-  const [aiText, setAiText] = useState('');
+  const [activeSymbol, setActiveSymbol] = usePersistedState('activeSymbol', null);
+  const [aiText, setAiText] = usePersistedState('aiText', '');
   const [aiLoading, setAiLoading] = useState(false);
 
   // ---- AlphaScan state -----------------------------------------------------
-  const [alphaState, setAlphaState] = useState({ status: 'idle' });
+  const [alphaState, setAlphaState] = usePersistedState('alphaState', { status: 'idle' });
   const [alphaLog, setAlphaLog] = useState([]);
   const [backendDown, setBackendDown] = useState(false);
 
@@ -89,6 +90,8 @@ export default function App() {
   const handleLogout = useCallback(() => {
     localStorage.removeItem(TOKEN_KEY);
     localStorage.removeItem('quantedge_user');
+    const keys = Object.keys(localStorage).filter((k) => k.startsWith('qe_'));
+    keys.forEach((k) => localStorage.removeItem(k));
     setCurrentUser(null);
     setSessionChecking(false);
   }, []);
@@ -129,6 +132,16 @@ export default function App() {
 
     return teardown;
   }, [handleLogout]);
+
+  // Keep-alive: ping backend every 4 min to prevent Render sleep
+  useEffect(() => {
+    if (!API_BASE) return;
+    fetch(`${API_BASE}/health`).catch(() => {});
+    const id = setInterval(() => {
+      fetch(`${API_BASE}/health`).catch(() => {});
+    }, 4 * 60 * 1000);
+    return () => clearInterval(id);
+  }, []);
 
   const handleLoggedIn = useCallback((res) => {
     setCurrentUser({ user_id: res.user_id, username: res.username, is_admin: res.is_admin });
@@ -290,7 +303,7 @@ export default function App() {
   // ---- Main render ---------------------------------------------------------
   return (
     <div style={{ minHeight: '100vh', background: C.bg, color: C.text }}>
-      <Header lastScan={lastScan} lastError={lastError} onLogout={handleLogout} wsConnected={wsConnected} currentUser={currentUser} />
+      <Header lastScan={lastScan} lastError={lastError} onLogout={handleLogout} wsConnected={wsConnected} currentUser={currentUser} fromCache={!!lastScan && !scanning} />
       <TopKpiStrip watchlist={watchlist} scanData={scanData} backtest={backtest} ml={ml} />
 
       {/* Tab nav */}
