@@ -1,8 +1,8 @@
 import React from 'react';
-import { LogOut, Sparkles, WifiOff } from 'lucide-react';
+import { Database, LogOut, Sparkles, WifiOff } from 'lucide-react';
 import { C, FONT_MONO, GRAD } from '../constants.js';
 
-export function Header({ lastScan, lastError, onLogout, wsConnected, currentUser }) {
+export function Header({ lastScan, lastError, onLogout, wsConnected, currentUser, fromCache }) {
   const live = !!lastScan;
 
   return (
@@ -48,6 +48,24 @@ export function Header({ lastScan, lastError, onLogout, wsConnected, currentUser
 
       {/* ── Right controls ────────────────────────────── */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+
+        {/* Cached data indicator */}
+        {fromCache && (
+          <div
+            title="Showing cached data — re-scan for fresh results"
+            style={{
+              display: 'inline-flex', alignItems: 'center', gap: 5,
+              padding: '4px 10px', borderRadius: 999,
+              background: 'rgba(167,139,250,0.08)',
+              border: '1px solid rgba(167,139,250,0.25)',
+              color: C.purple,
+              fontSize: 11, fontWeight: 600,
+            }}
+          >
+            <Database size={11} />
+            Cached
+          </div>
+        )}
 
         {/* WS status */}
         {wsConnected !== undefined && (
