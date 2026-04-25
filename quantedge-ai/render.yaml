@@ -66,3 +66,5 @@ services:
       # ANTHROPIC_API_KEY / PORTKEY_API_KEY
       # TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
       # MASTER_PASSWORD   (optional — auto-unlocks encrypted vault)
+      # SUPABASE_URL      (required — https://<project>.supabase.co)
+      # SUPABASE_KEY      (required — service_role key for user persistence)

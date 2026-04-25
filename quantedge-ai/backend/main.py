@@ -52,6 +52,11 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from supabase_users import (
+    supabase_enabled, supabase_get_user, supabase_get_user_by_id,
+    supabase_get_all_users, supabase_insert_user, supabase_update_user,
+    supabase_ensure_table,
+)
 
 # PyJWT is a hard dependency (listed in requirements.txt). Import it at the
 # module level so _issue_user_token / _verify_user_token always have it,
@@ -4740,22 +4745,49 @@ _keep_alive_task: asyncio.Task | None = None
 KEEP_ALIVE_INTERVAL = int(os.getenv("KEEP_ALIVE_INTERVAL", "240"))
 
 async def _keep_alive_loop() -> None:
-    """Self-ping every 4 minutes to prevent Render free-tier sleep."""
-    port = int(os.getenv("PORT", "8000"))
-    url = f"http://localhost:{port}/health"
+    """Ping our own external URL every 4 min to prevent Render free-tier sleep.
+    Render only counts external inbound requests — localhost pings are ignored."""
+    external_url = os.getenv("RENDER_EXTERNAL_URL", "")
+    if not external_url:
+        logger.info("RENDER_EXTERNAL_URL not set — keep-alive disabled (local dev).")
+        return
+    url = f"{external_url}/health"
+    logger.info("Keep-alive target: %s (every %ds)", url, KEEP_ALIVE_INTERVAL)
     async with httpx.AsyncClient(timeout=10) as client:
         while True:
             await asyncio.sleep(KEEP_ALIVE_INTERVAL)
             try:
-                await client.get(url)
-                logger.debug("Keep-alive ping OK")
-            except Exception:
-                pass
+                resp = await client.get(url)
+                logger.debug("Keep-alive ping OK (%d)", resp.status_code)
+            except Exception as exc:
+                logger.debug("Keep-alive ping failed: %s", exc)
 
 
 @app.on_event("startup")
 async def _start_background_tasks() -> None:
     global _monitor_task, _price_poll_task, _keep_alive_task
+
+    # Sync users from Supabase → local SQLite (restores user data after restart)
+    if supabase_enabled():
+        try:
+            ok = await supabase_ensure_table()
+            if ok:
+                remote_users = await supabase_get_all_users()
+                if remote_users:
+                    with _db_lock, _db_connect() as conn:
+                        for u in remote_users:
+                            conn.execute(
+                                "INSERT OR IGNORE INTO users (username, email, password_hash, created_at, is_admin, is_active) VALUES (?,?,?,?,?,?)",
+                                (u["username"], u.get("email"), u["password_hash"],
+                                 u["created_at"], u.get("is_admin", 0), u.get("is_active", 1)),
+                            )
+                    logger.info("Synced %d user(s) from Supabase into local SQLite.", len(remote_users))
+                else:
+                    logger.info("Supabase users table is empty — no users to sync.")
+            else:
+                logger.warning("Supabase users table not accessible — skipping sync.")
+        except Exception as exc:
+            logger.warning("Supabase startup sync failed: %s", exc)
 
     # Auto-unlock vault if MASTER_PASSWORD env var is set so API keys
     # (TwelveData, Anthropic, etc.) are available without a manual unlock step.
@@ -4999,6 +5031,11 @@ class ChangePasswordRequest(BaseModel):
 async def auth_register(req: AuthRegisterRequest) -> dict[str, Any]:
     if not _BCRYPT_OK:
         raise HTTPException(status_code=501, detail="bcrypt not installed on server.")
+    # Check Supabase first for existing username (survives restarts)
+    if supabase_enabled():
+        remote = await supabase_get_user(req.username)
+        if remote:
+            raise HTTPException(status_code=409, detail="Username already taken.")
     with _db_lock, _db_connect() as conn:
         existing = conn.execute(
             "SELECT id FROM users WHERE username=?", (req.username,)
@@ -5007,14 +5044,19 @@ async def auth_register(req: AuthRegisterRequest) -> dict[str, Any]:
             raise HTTPException(status_code=409, detail="Username already taken.")
         user_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         is_admin = 1 if user_count == 0 else 0  # first user becomes admin
+        pw_hash = _hash_password(req.password)
+        created = _now_iso()
         conn.execute(
             "INSERT INTO users (username, email, password_hash, created_at, is_admin) VALUES (?,?,?,?,?)",
-            (req.username, req.email, _hash_password(req.password), _now_iso(), is_admin),
+            (req.username, req.email, pw_hash, created, is_admin),
         )
         user_id = conn.execute(
             "SELECT id FROM users WHERE username=?", (req.username,)
         ).fetchone()["id"]
         _ensure_user_paper_settings(conn, user_id)
+    # Persist to Supabase so user survives backend restart
+    if supabase_enabled():
+        await supabase_insert_user(req.username, req.email, pw_hash, created, bool(is_admin))
     logger.info("New user registered: %s (id=%d, admin=%s)", req.username, user_id, bool(is_admin))
     _db_backup()
     return {"ok": True, **_issue_user_token(user_id, req.username, bool(is_admin))}
@@ -5029,6 +5071,23 @@ async def auth_login(req: AuthLoginRequest) -> dict[str, Any]:
             "SELECT id, password_hash, is_admin, is_active FROM users WHERE username=?",
             (req.username,),
         ).fetchone()
+    # If not in local SQLite, try Supabase (user may have registered before restart)
+    if not row and supabase_enabled():
+        remote = await supabase_get_user(req.username)
+        if remote and _verify_password(req.password, remote["password_hash"]):
+            with _db_lock, _db_connect() as conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO users (username, email, password_hash, created_at, is_admin, is_active) VALUES (?,?,?,?,?,?)",
+                    (remote["username"], remote.get("email"), remote["password_hash"],
+                     remote["created_at"], remote.get("is_admin", 0), remote.get("is_active", 1)),
+                )
+                row = conn.execute(
+                    "SELECT id, password_hash, is_admin, is_active FROM users WHERE username=?",
+                    (req.username,),
+                ).fetchone()
+                if row:
+                    _ensure_user_paper_settings(conn, row["id"])
+            logger.info("Synced user %s from Supabase after restart", req.username)
     if not row or not _verify_password(req.password, row["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid username or password.")
     if not row["is_active"]:
@@ -5043,6 +5102,22 @@ async def auth_me(user: dict = Depends(get_current_user)) -> dict[str, Any]:
             "SELECT id, username, email, created_at, is_admin FROM users WHERE id=?",
             (user["user_id"],),
         ).fetchone()
+    # If not in local SQLite, try Supabase (DB may have been wiped after restart)
+    if not row and supabase_enabled():
+        remote = await supabase_get_user_by_id(user["user_id"])
+        if remote:
+            with _db_lock, _db_connect() as conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO users (id, username, email, password_hash, created_at, is_admin, is_active) VALUES (?,?,?,?,?,?,?)",
+                    (remote["id"], remote["username"], remote.get("email"), remote["password_hash"],
+                     remote["created_at"], remote.get("is_admin", 0), remote.get("is_active", 1)),
+                )
+                _ensure_user_paper_settings(conn, remote["id"])
+                row = conn.execute(
+                    "SELECT id, username, email, created_at, is_admin FROM users WHERE id=?",
+                    (user["user_id"],),
+                ).fetchone()
+            logger.info("Synced user id=%d from Supabase after restart", user["user_id"])
     if not row:
         raise HTTPException(status_code=404, detail="User not found.")
     return dict(row)
@@ -5058,11 +5133,14 @@ async def auth_change_password(
         ).fetchone()
     if not row or not _verify_password(req.current_password, row["password_hash"]):
         raise HTTPException(status_code=401, detail="Current password is incorrect.")
+    new_hash = _hash_password(req.new_password)
     with _db_lock, _db_connect() as conn:
         conn.execute(
             "UPDATE users SET password_hash=? WHERE id=?",
-            (_hash_password(req.new_password), user["user_id"]),
+            (new_hash, user["user_id"]),
         )
+    if supabase_enabled():
+        await supabase_update_user(user["user_id"], {"password_hash": new_hash})
     return {"ok": True, "message": "Password changed successfully."}
 
 
@@ -5087,6 +5165,8 @@ async def auth_deactivate_user(uid: int, user: dict = Depends(get_current_user))
         raise HTTPException(status_code=400, detail="Cannot deactivate your own account.")
     with _db_lock, _db_connect() as conn:
         conn.execute("UPDATE users SET is_active=0 WHERE id=?", (uid,))
+    if supabase_enabled():
+        await supabase_update_user(uid, {"is_active": 0})
     return {"ok": True}
 
 
